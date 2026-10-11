@@ -283,7 +283,9 @@ impl Store {
         let mut d = old.clone();
         d.title = title.to_string();
         d.text = text.to_string();
-        d.query = query.to_string();
+        // 刷新只该换正文：主题标注（query）与来源分组（source）是用户/订阅的元数据，别顺手清掉
+        if !query.trim().is_empty() { d.query = query.to_string(); }
+        if !source.trim().is_empty() && d.source.trim().is_empty() { d.source = source.to_string(); }
         d.text_len = chars;
         d.shingle = title_shingle(title);
         d.simhash = simhash(text);
@@ -726,6 +728,13 @@ mod tests {
         let d = s.save_refresh(url, "标题", &short, "查询词", "gui-browser", 10, "fallback").unwrap();
         assert!(d.starts_with("skip: duplicate url"), "{}", d);
         assert_eq!(s.last().unwrap().mode, "cluster", "不该被 fallback 短文本覆盖");
+        // 刷新换正文时保留主题标注 / 来源分组（不能因为这次 capture 的 query 为空就把订阅关联清掉）
+        let longer = "刷新后的正文更长一些，用来触发纯字数替换路径。".repeat(30);
+        let e = s.save_refresh(url, "标题", &longer, "", "其他来源", 10, "cluster").unwrap();
+        assert!(e.starts_with("replaced:"), "{}", e);
+        let kept = s.last().unwrap();
+        assert_eq!(kept.query, "查询词", "主题标注不该被空 query 覆盖");
+        assert_eq!(kept.source, "gui-browser", "来源分组不该被改写");
         // 落盘后再打开：替换结果持久化，去重表已重建（同标题不同 URL 仍会被标题 shingle 拦住）
         let back = Store::open(&p, DEFAULT_TTL_DAYS).unwrap();
         assert_eq!(back.stats().docs, 1);
