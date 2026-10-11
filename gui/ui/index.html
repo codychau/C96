@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>C96 — 浏览器自控层 (E1)</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font: 14px/1.6 "Segoe UI", system-ui, sans-serif; background: #14161a; color: #e6e6e6; }
+    header { padding: 14px 18px; border-bottom: 1px solid #2a2e36; }
+    header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+    header p { margin: 4px 0 0; color: #9aa4b2; font-size: 12px; }
+    main { padding: 18px; max-width: 980px; }
+    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+    input[type=text] { flex: 1 1 520px; min-width: 320px; background: #1c2027; color: #e6e6e6;
+      border: 1px solid #333a45; border-radius: 6px; padding: 8px 10px; font: inherit; }
+    button { background: #2f6fed; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px;
+      font: inherit; cursor: pointer; }
+    button.secondary { background: #2a2e36; color: #cbd5e1; }
+    button:active { transform: translateY(1px); }
+    pre { background: #0e1013; border: 1px solid #262b33; border-radius: 8px; padding: 12px;
+      overflow: auto; max-height: 420px; white-space: pre-wrap; word-break: break-word; color: #cbd5e1; }
+    .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; background: #1f2937;
+      color: #93c5fd; font-size: 11px; margin-right: 6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>C96 — 浏览器自控层 <span class="tag">E1</span></h1>
+    <p>Tauri v2 外壳（默认 WebView2）+ 自控窗口（快照 JS 注入骨架）· 纯静态前端，无需 npm</p>
+  </header>
+  <main>
+    <div class="row">
+      <input id="url" type="text" spellcheck="false"
+        value="https://www.baidu.com/s?wd=rust%20%E7%BC%96%E8%AF%91%E5%99%A8&amp;rn=20" />
+      <button id="open">打开自控窗口</button>
+      <button id="snapshot" class="secondary">列出注入的 JS 钩子</button>
+      <button id="banner" class="secondary">调用 Rust banner()</button>
+    </div>
+    <div class="row">
+      <button id="rawinfo" class="secondary">裸 WebView2 信息 (browser)</button>
+      <button id="rawzoom" class="secondary">缩放 1.5x (browser)</button>
+      <button id="rawmain" class="secondary">裸 WebView2 信息 (main)</button>
+    </div>
+    <div class="row">
+      <button id="events" class="secondary">列出事件</button>
+      <button id="clear" class="secondary">清空事件</button>
+      <span style="color:#9aa4b2;font-size:12px">E2 事件：页面点击/SPA 经 WebView2 postMessage → AddWebMessageReceived → Rust</span>
+    </div>
+    <pre id="log">就绪。点「打开自控窗口」会在第二个 WebView2 窗口里加载该 URL（Rust 侧已注入快照钩子）。</pre>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

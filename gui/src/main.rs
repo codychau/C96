@@ -1,0 +1,777 @@
+//! C96 阶段 E — Tauri v2 GUI：默认双击（无参数）= 浏览器主窗口 + 搜索条 + 自动 RAG 采集。
+//!
+//! 独立 crate（gui/），不进入根 C96 的零依赖核心构建。
+//! 主窗口直接加载外部网页，页面里注入 C96 搜索条（搜内容/网址），
+//! 每次页面加载后把正文自动写入本地 RAG 知识库（store.rs，JSONL + URL 去重）。
+//!
+//! 附带：--selftest（E1/E2 裸 WebView2 + 事件）、--selftest-rag（E3 自动入库）、
+//!      --selftest-topics（I 主题订阅）、--selftest-links（链接点击：target=_blank / window.open）。
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod browser;
+mod store;
+
+use tauri::Manager;
+
+const BANNER: &str = "C96 — 资讯聚合 → RSS-like 订阅 → 完整索引 → 本地 AI 知识库";
+const START_URL: &str = "https://www.bing.com/";
+
+#[tauri::command]
+fn banner() -> String {
+    return BANNER.to_string() + " · GUI (E1+E2+E3, Tauri v2 + WebView2)";
+}
+
+#[tauri::command]
+fn open_browser(app: tauri::AppHandle, url: String) -> Result<String, String> {
+    return browser::open(&app, &url);
+}
+
+#[tauri::command]
+fn snapshot_probe(app: tauri::AppHandle) -> Result<String, String> {
+    return browser::probe(&app);
+}
+
+#[tauri::command]
+fn webview2_info(app: tauri::AppHandle, label: Option<String>) -> Result<String, String> {
+    let l = label.unwrap_or_else(|| "browser".to_string());
+    return browser::raw_info(&app, &l);
+}
+
+#[tauri::command]
+fn webview2_zoom(app: tauri::AppHandle, label: Option<String>, factor: f64) -> Result<String, String> {
+    let l = label.unwrap_or_else(|| "browser".to_string());
+    return browser::raw_zoom(&app, &l, factor);
+}
+
+#[tauri::command]
+fn webview2_navigate(app: tauri::AppHandle, label: Option<String>, url: String) -> Result<String, String> {
+    let l = label.unwrap_or_else(|| "browser".to_string());
+    return browser::raw_navigate(&app, &l, &url);
+}
+
+/// RSS 内容管理器（注入的顶部工具栏面板）用的命令：增 / 删 / 改 / 查。
+#[tauri::command]
+fn topic_update(app: tauri::AppHandle, query: String, interval_secs: u64, paused: Option<bool>) -> Result<bool, String> {
+    return store::topic_update(&app, &query, interval_secs, paused);
+}
+
+/// 查：某关键词订阅最近的条目（轻量行，不带正文）。
+#[tauri::command]
+fn topic_docs(app: tauri::AppHandle, query: String, limit: Option<usize>) -> Result<Vec<store::DocRow>, String> {
+    return store::topic_docs(&app, &query, limit.unwrap_or(20));
+}
+
+/// 查：来源分组（/rss/source/<name>.xml）。
+#[tauri::command]
+fn rss_sources(app: tauri::AppHandle) -> Result<Vec<store::SourceRow>, String> {
+    return store::sources(&app);
+}
+
+/// 删：删一条内容（按 hash）。
+#[tauri::command]
+fn rss_doc_remove(app: tauri::AppHandle, hash: String) -> Result<bool, String> {
+    return store::doc_remove(&app, &hash);
+}
+
+/// 订阅地址（本机 / 局域网 / token）。
+#[tauri::command]
+fn rss_base() -> store::RssBase {
+    return store::rss_base();
+}
+
+/// 事件通过 Tauri IPC 兜底回传（首选是 WebView2 原生 postMessage）。
+#[tauri::command]
+fn browser_event(app: tauri::AppHandle, payload: String) -> Result<(), String> {
+    browser::ingest(&app, &payload);
+    return Ok(());
+}
+
+#[tauri::command]
+fn browser_events() -> Vec<browser::BrowserEvent> {
+    return browser::list_events();
+}
+
+#[tauri::command]
+fn browser_events_clear() -> usize {
+    return browser::clear_events();
+}
+
+/// E3：RAG 知识库统计。
+#[tauri::command]
+fn kb_stats(app: tauri::AppHandle) -> Result<store::KbStats, String> {
+    return store::stats(&app);
+}
+
+/// E3：在已入库文档里做关键词检索。
+#[tauri::command]
+fn kb_search(app: tauri::AppHandle, query: String, limit: Option<usize>) -> Result<Vec<store::KbHit>, String> {
+    return store::search(&app, &query, limit.unwrap_or(20));
+}
+
+/// F：显式丢弃超过 TTL（默认 30 天）的知识库记录。
+#[tauri::command]
+fn kb_purge(app: tauri::AppHandle) -> Result<usize, String> {
+    return store::purge(&app);
+}
+
+/// I：主题查询（没搜过立刻搜索入库；命中读 RAG；太旧先给旧数据并后台刷新）。
+#[tauri::command]
+fn topic_query(app: tauri::AppHandle, query: String, cache_only: Option<bool>) -> Result<store::ServeResult, String> {
+    return store::topic_query(&app, &query, cache_only.unwrap_or(false));
+}
+
+/// I：任务清单。
+#[tauri::command]
+fn topic_list(app: tauri::AppHandle) -> Result<Vec<store::Topic>, String> {
+    return store::topic_list(&app);
+}
+
+/// I：立即刷新一个主题。
+#[tauri::command]
+fn topic_run(app: tauri::AppHandle, query: String) -> Result<store::TopicRun, String> {
+    return store::topic_run(&app, &query);
+}
+
+/// I：删除一个主题任务（RAG 文档保留，等 TTL）。
+#[tauri::command]
+fn topic_remove(app: tauri::AppHandle, query: String) -> Result<bool, String> {
+    return store::topic_remove(&app, &query);
+}
+
+/// I：把主题时间回拨（运维 / 自检用）。
+#[tauri::command]
+fn topic_backdate(app: tauri::AppHandle, query: String, secs: u64) -> Result<bool, String> {
+    return store::topic_backdate(&app, &query, secs);
+}
+
+fn topic_line(t: &store::Topic) -> String {
+    let now = c96::store::doc::now_ms();
+    let tag = if t.paused { "paused" } else if c96::store::state::is_due(t, now) { "DUE" } else { "wait" };
+    return format!("[{}] \"{}\" runs={} stored={} interval={}s fresh={}s next_due_ms={} docs={} status={}",
+        tag, t.query, t.runs, t.stored, t.interval_secs, t.fresh_secs, t.next_due_ms, t.docs.len(), t.last_status);
+}
+
+fn dump_events(tag: &str) {
+    let evs = browser::list_events();
+    let mut clicks = 0;
+    let mut navs = 0;
+    let mut loads = 0;
+    let mut ready = 0;
+    let mut spa = 0;
+    for e in &evs {
+        match e.kind.as_str() {
+            "click" => clicks += 1,
+            "navigation" => navs += 1,
+            "load-start" => loads += 1,
+            "load-finish" => loads += 1,
+            "ready" => ready += 1,
+            "spa" => spa += 1,
+            _ => {}
+        }
+    }
+    println!(
+        "[selftest] events {}: total={} click={} nav={} load={} ready={} spa={}",
+        tag, evs.len(), clicks, navs, loads, ready, spa
+    );
+    for e in &evs {
+        println!("  #{:<3} {:<11} {}", e.seq, e.kind, e.url);
+    }
+}
+
+/// 主窗口启动：先装 web-message 接收器，再导航到起始页。
+fn boot_main(app: tauri::AppHandle) {
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    match browser::install_web_message(&app, "main") {
+        Ok(s) => println!("[c96] main web-message: {}", s),
+        Err(e) => println!("[c96] main web-message ERR: {}", e),
+    }
+    match browser::raw_navigate(&app, "main", START_URL) {
+        Ok(s) => println!("[c96] main start -> {}", s),
+        Err(e) => println!("[c96] main start ERR: {}", e),
+    }
+    match store::stats(&app) {
+        Ok(st) => println!("[c96] RAG 知识库: {} ({} 文档, {} 字节, ttl={}d, purged(open)={})",
+            st.path, st.docs, st.bytes, st.ttl_days, st.purged),
+        Err(e) => println!("[c96] RAG 知识库 ERR: {}", e),
+    }
+    match store::topic_list(&app) {
+        Ok(ts) => {
+            println!("[c96] 主题任务: {} 个（state.toml [[topic]]）", ts.len());
+            for t in ts.iter().take(8) { println!("  {}", topic_line(t)); }
+        }
+        Err(e) => println!("[c96] 主题任务 ERR: {}", e),
+    }
+    // 常驻调度：程序一直运行 -> 到期自动再搜一次并写 RAG（用户原则 1）
+    match store::handle(&app) {
+        Ok(arc) => {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let tick = c96::research::DEFAULT_SCHED_TICK_SECS;
+            let _h = c96::research::spawn_scheduler(arc, store::run_opts(), tick, stop, Box::new(|m| println!("{}", m)));
+            println!("[c96] 主题调度线程: 启动（tick={}s，到期任务自动刷新）", tick);
+        }
+        Err(e) => println!("[c96] 主题调度 ERR: {}", e),
+    }
+    // I3/I4：启动即本地 RSS 服务器 —— 关键词搜到新结果就变成 feed 里的新条目（阅读器轮询即见）
+    match store::handle(&app) {
+        Ok(arc) => {
+            let bind = std::env::var("C96_RSS_BIND").unwrap_or_else(|_| c96::rss::DEFAULT_BIND.to_string());
+            // 默认不设 token（地址干净，阅读器直接添加最好）；只有显式设 C96_RSS_TOKEN 才要 ?t=
+            let token = std::env::var("C96_RSS_TOKEN").unwrap_or_default();
+            match c96::rss::spawn_server(arc, &bind, &token) {
+                Ok(adv) => {
+                    // 面板要能同时给出本机地址与局域网地址：监听通配时 adv 是局域网 IP
+                    let local = if c96::rss::is_loopback(&bind) {
+                        adv.clone()
+                    } else {
+                        let port = adv.rsplit(':').next().unwrap_or("").to_string();
+                        format!("127.0.0.1:{}", port)
+                    };
+                    store::set_rss_base(&local, &adv, &token);
+                    println!("[c96] RSS 服务已就绪: http://{}/", local);
+                    println!("[c96] OPML 一键导入: http://{}/opml.xml", local);
+                    if token.is_empty() { println!("[c96] 局域网无 token 直连：阅读器直接添加上面地址；要限制访问就设 C96_RSS_TOKEN"); }
+                    else { println!("[c96] 订阅地址须带 ?t={}", token); }
+                }
+                Err(e) => println!("[c96] RSS 服务未启动: {}", e),
+            }
+        }
+        Err(e) => println!("[c96] RSS 服务 ERR: {}", e),
+    }
+}
+
+/// E1/E2 无人值守自检（裸 WebView2 + 事件通道）。
+fn run_selftest(app: tauri::AppHandle) {
+    println!("[selftest] E1+E2 start");
+    match browser::open(&app, "https://example.com/") {
+        Ok(m) => println!("[selftest] open_browser -> {}", m),
+        Err(e) => println!("[selftest] open_browser ERR: {}", e),
+    }
+    std::thread::sleep(std::time::Duration::from_secs(4));
+
+    if let Some(win) = app.get_webview_window("browser") {
+        let js = "document.title = (window.__C96_SNAPSHOT__ ? 'C96_HOOK_OK' : 'C96_HOOK_MISSING');";
+        match win.eval(js) {
+            Ok(()) => println!("[selftest] eval set title"),
+            Err(e) => println!("[selftest] eval ERR: {}", e),
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    match browser::raw_info(&app, "browser") {
+        Ok(m) => println!("[selftest] raw_info(browser) #1:{}", m),
+        Err(e) => println!("[selftest] raw_info #1 ERR: {}", e),
+    }
+    match browser::raw_zoom(&app, "browser", 1.5) {
+        Ok(m) => println!("[selftest] raw_zoom -> {}", m),
+        Err(e) => println!("[selftest] raw_zoom ERR: {}", e),
+    }
+
+    if let Some(win) = app.get_webview_window("browser") {
+        let js = "var b=document.createElement('button'); b.id='c96-selftest'; b.textContent='C96 click probe'; document.body.appendChild(b); b.click();";
+        match win.eval(js) {
+            Ok(()) => println!("[selftest] E2 synthetic click dispatched"),
+            Err(e) => println!("[selftest] E2 click ERR: {}", e),
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    dump_events("after synthetic click");
+
+    match browser::raw_navigate(&app, "browser", "https://www.rust-lang.org/") {
+        Ok(m) => println!("[selftest] raw_navigate -> {}", m),
+        Err(e) => println!("[selftest] raw_navigate ERR: {}", e),
+    }
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    dump_events("after navigate");
+    match browser::raw_info(&app, "browser") {
+        Ok(m) => println!("[selftest] raw_info(browser) #2:{}", m),
+        Err(e) => println!("[selftest] raw_info #2 ERR: {}", e),
+    }
+    println!("[selftest] E1+E2 done");
+    app.exit(0);
+}
+
+/// E3 无人值守自检：导航主窗口到一个新 URL，确认正文被自动写入 RAG 并可检索。
+fn run_selftest_rag(app: tauri::AppHandle) {
+    println!("[selftest-rag] start");
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    let before = store::stats(&app).map(|s| s.docs).unwrap_or(0);
+    println!("[selftest-rag] kb before = {}", before);
+    let stamp = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis(),
+        Err(_) => 0,
+    };
+    let url = format!("https://www.rust-lang.org/?c96-e2e={}", stamp);
+    match browser::raw_navigate(&app, "main", &url) {
+        Ok(m) => println!("[selftest-rag] navigate -> {}", m),
+        Err(e) => println!("[selftest-rag] navigate ERR: {}", e),
+    }
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    let after = store::stats(&app).map(|s| s.docs).unwrap_or(0);
+    println!("[selftest-rag] kb after = {} (delta {})", after, after.saturating_sub(before));
+    match store::search(&app, "Rust", 5) {
+        Ok(h) => {
+            println!("[selftest-rag] search 'Rust' hits = {}", h.len());
+            for x in h.iter().take(3) {
+                println!("  score={} {} {}", x.score, x.host, x.title);
+            }
+        }
+        Err(e) => println!("[selftest-rag] search ERR: {}", e),
+    }
+    // 去重验证：重新导航同一 URL，应 skip: duplicate url，kb 不增长
+    match browser::raw_navigate(&app, "main", &url) {
+        Ok(m) => println!("[selftest-rag] re-navigate -> {}", m),
+        Err(e) => println!("[selftest-rag] re-navigate ERR: {}", e),
+    }
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let last_store = browser::list_events().into_iter().rev().find(|e| e.kind == "store" || e.kind == "store-error");
+    match last_store {
+        Some(e) => println!("[selftest-rag] dup check -> kind={} detail={} url={}", e.kind, e.detail, e.url),
+        None => println!("[selftest-rag] dup check -> no store event"),
+    }
+    let after_dup = store::stats(&app).map(|s| s.docs).unwrap_or(0);
+    println!("[selftest-rag] kb after dup = {} (should equal {})", after_dup, after);
+    // 搜索输入链路：模拟在叠加条输入并回车 → Bing SERP → 自动入库（带 query）
+    if let Some(win) = app.get_webview_window("main") {
+        let js = "var i=document.getElementById('c96-q'); if(i){ i.value='c96 端到端检索'; i.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true})); }";
+        match win.eval(js) {
+            Ok(()) => println!("[selftest-rag] search input simulated"),
+            Err(e) => println!("[selftest-rag] search eval ERR: {}", e),
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_secs(7));
+    match store::last(&app) {
+        Some(d) => println!("[selftest-rag] last stored -> host={} title={} query={} text_len={}", d.host, d.title, d.query, d.text_len),
+        None => println!("[selftest-rag] last stored -> none"),
+    }
+    let evs = browser::list_events();
+    println!("[selftest-rag] events = {}", evs.len());
+    let tail: Vec<browser::BrowserEvent> = evs.iter().rev().take(10).cloned().collect();
+    for e in tail.iter().rev() {
+        println!("  #{:<3} {:<11} {}", e.seq, e.kind, e.url);
+    }
+    // F：TTL 自检 —— 注入 31 天前的记录，purge 必须丢弃（默认 TTL 30 天）
+    let before_ttl = store::stats(&app).map(|s| s.docs).unwrap_or(0);
+    let probe_text = "过期正文 probe ".to_string() + &"Rust 编译器 存储层 TTL 验证 ".repeat(40);
+    match store::inject_backdated(&app, "https://c96-ttl.example.org/probe", "TTL 过期探针", &probe_text, "ttl", 31) {
+        Ok(m) => println!("[selftest-rag] ttl inject -> {}", m),
+        Err(e) => println!("[selftest-rag] ttl inject ERR: {}", e),
+    }
+    let mid_ttl = store::stats(&app).map(|s| s.docs).unwrap_or(0);
+    match store::purge(&app) {
+        Ok(n) => println!("[selftest-rag] ttl purge dropped = {}", n),
+        Err(e) => println!("[selftest-rag] ttl purge ERR: {}", e),
+    }
+    let after_ttl = store::stats(&app).map(|s| s.docs).unwrap_or(0);
+    println!("[selftest-rag] kb ttl check: before={} injected={} after_purge={} (expect after == before)",
+        before_ttl, mid_ttl, after_ttl);
+    println!("[selftest-rag] done");
+    app.exit(0);
+}
+
+/// 生成"先算表达式、再用 WebView2 原生通道回传"的探测 JS。
+/// 不依赖注入脚本 / __C96_RSS_UI__ 是否成功，纯 DOM + postMessage。
+fn post_js(expr: &str) -> String {
+    return "(function(){ var m; try { m = String(".to_string() + expr
+        + "); } catch (e) { m = 'EXPR-ERR ' + e; } try { window.chrome.webview.postMessage(JSON.stringify({ type: 'rss-ui', url: location.href, detail: m })); } catch (e) {} })();";
+}
+
+/// 自检用：直接 GET 本进程 RSS 服务器（端口取 C96_RSS_BIND，默认 127.0.0.1:8787）。
+fn rss_fetch(path: &str) -> String {
+    use std::io::Read;
+    use std::io::Write;
+    let bind = std::env::var("C96_RSS_BIND").unwrap_or_else(|_| "127.0.0.1:8787".to_string());
+    let addr = if bind.starts_with("0.0.0.0:") { bind.replacen("0.0.0.0:", "127.0.0.1:", 1) } else if bind.contains(':') { bind } else { format!("127.0.0.1:{}", bind) };
+    let mut out = String::new();
+    if let Ok(mut s) = std::net::TcpStream::connect(&addr) {
+        let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let req = format!("GET {} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", path);
+        if s.write_all(req.as_bytes()).is_ok() {
+            let _ = s.read_to_string(&mut out);
+        }
+    }
+    return out;
+}
+
+/// E7 无人值守自检：RSS 内容管理器（注入顶部工具栏的面板）—— 真点击驱动 增 / 改 / 查 / 删。
+fn run_selftest_rss_ui(app: tauri::AppHandle) {
+    println!("[selftest-rss-ui] start");
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    let win = match app.get_webview_window("main") {
+        Some(w) => w,
+        None => { println!("[selftest-rss-ui] 主窗口不存在"); app.exit(0); return; }
+    };
+    // 用本地页跑，隔离真站 SPA 的干扰
+    let dir = std::env::temp_dir().join("c96_rss_ui");
+    let _ = std::fs::create_dir_all(&dir);
+    let page = dir.join("page.html");
+    let _ = std::fs::write(&page, "<!doctype html><meta charset=utf-8><title>C96 rss ui</title><body><h1>rss ui selftest</h1></body>");
+    let page_url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
+    let _ = browser::raw_navigate(&app, "main", &page_url);
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+
+    // 0) 防御性探针：确认注入脚本/图标/IPC 是否就位（不依赖面板自己的上报）
+    let _ = win.eval(&post_js("'probe bar=' + !!document.getElementById('c96-bar') + ' btn=' + !!document.getElementById('c96-rss-btn') + ' ui=' + (typeof window.__C96_RSS_UI__) + ' ipc=' + !!(window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke)"));
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    // 1) 点顶部工具栏图标 -> 面板打开并加载数据
+    let _ = win.eval("document.getElementById('c96-rss-btn') && document.getElementById('c96-rss-btn').click();");
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    let _ = win.eval(&post_js("'afterClick panel=' + !!document.getElementById('c96-rss-panel') + ' display=' + (document.getElementById('c96-rss-panel') ? document.getElementById('c96-rss-panel').style.display : '-')"));
+    let _ = win.eval("window.__C96_RSS_UI__ && window.__C96_RSS_UI__.reload();");
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    let _ = win.eval(&post_js("'reload 状态=' + (document.getElementById('c96-rss-status') ? document.getElementById('c96-rss-status').textContent : '-')"));
+    let _ = win.eval(&post_js("'panel=' + (document.getElementById('c96-rss-panel') ? document.getElementById('c96-rss-panel').style.display : 'missing') + ' 订阅行=' + document.querySelectorAll('#c96-rss-topics > div').length + ' 来源行=' + document.querySelectorAll('#c96-rss-sources > div').length + ' 地址行=' + document.querySelectorAll('#c96-rss-urls > div').length"));
+    std::thread::sleep(std::time::Duration::from_millis(700));
+
+    // 1.5) 造 3 条「随手收录」（source=gui-browser，query 空）—— 模拟随便搜索/打开的页面
+    let junk_host = "c96-junk.example.com";
+    let keep_host = "c96-keep.example.com";
+    let _ = store::host_remove(&app, junk_host);
+    let _ = store::host_remove(&app, keep_host);
+    let _ = store::ignore_host(&app, junk_host, false);
+    let mut junk_ok = 0;
+    for (u, t, x) in [
+        ("https://c96-junk.example.com/a", "C96JUNK-A", "C96 junk alpha body"),
+        ("https://c96-junk.example.com/b", "C96JUNK-B", "C96 junk bravo body"),
+        ("https://c96-keep.example.com/c", "C96JUNK-C", "C96 junk charlie body"),
+    ] {
+        if let Ok(m) = store::save(&app, u, t, x, "", 0) {
+            if m.starts_with("stored:") { junk_ok += 1; }
+        }
+    }
+    println!("[selftest-rss-ui] 1.5) 造随手收录 {}/3 条（source=gui-browser, query 空）", junk_ok);
+
+    // 2) 增：界面填关键词 + 间隔 -> 点「添加订阅」
+    let q = "c96 rss 管理器自检";
+    let js_add = "(function(){ document.getElementById('c96-rss-new-q').value = '".to_string()
+        + q + "'; document.getElementById('c96-rss-new-int').value = '600'; document.getElementById('c96-rss-add').click(); })();";
+    let _ = win.eval(&js_add);
+    std::thread::sleep(std::time::Duration::from_millis(22000));
+    let key = c96::store::state::topic_key(q);
+    let added = store::topic_list(&app).unwrap_or_default().into_iter().find(|t| t.key == key);
+    match &added {
+        Some(t) => println!("[selftest-rss-ui] 1) 增 OK: query={} 间隔={}s runs={} stored={} 最近条目={}",
+            t.query, t.interval_secs, t.runs, t.stored, t.docs.len()),
+        None => println!("[selftest-rss-ui] 1) 增 FAIL: 订阅未建立"),
+    }
+
+    // 2.5) 「只看随手收录」：订阅还在时，随手那批留下、订阅那批排除（判定在 Rust 侧）
+    let off_shown = store::docs_all(&app, "", false, 300).ok()
+        .and_then(|v| v.get("shown").and_then(|x| x.as_u64())).unwrap_or(0);
+    let on_docs = store::docs_all(&app, "", true, 300).ok().unwrap_or(serde_json::Value::Null);
+    let on_shown = on_docs.get("shown").and_then(|x| x.as_u64()).unwrap_or(0);
+    let on_junk = on_docs.get("rows").and_then(|x| x.as_array())
+        .map(|a| a.iter().filter(|r| r.get(3).and_then(|h| h.as_str()) == Some(junk_host)).count()).unwrap_or(0);
+    let filt_junk = store::docs_all(&app, "C96JUNK", false, 300).ok()
+        .and_then(|v| v.get("shown").and_then(|x| x.as_u64())).unwrap_or(0);
+    println!("[selftest-rss-ui] 2.5) 只看随手 {}: 全部={} 随手={}（随手里 junk={}）过滤 C96JUNK={}",
+        if on_shown < off_shown && on_junk >= 2 { "OK" } else { "FAIL" }, off_shown, on_shown, on_junk, filt_junk);
+
+    // 3) 改：界面改间隔 -> 900
+    let _ = win.eval(&("(function(){ var i = document.getElementById('c96-rss-int-".to_string() + &key
+        + "'); var b = document.getElementById('c96-rss-save-" + &key
+        + "'); if (i) { i.value = '900'; } if (b) { b.click(); } })();"));
+    let probe_el = "'UI 元素 间隔输入=' + (document.getElementById('c96-rss-int-".to_string() + &key
+        + "') ? 'yes' : 'no') + ' 保存按钮=' + (document.getElementById('c96-rss-save-" + &key + "') ? 'yes' : 'no')";
+    let _ = win.eval(&post_js(&probe_el));
+    std::thread::sleep(std::time::Duration::from_millis(2200));
+    let iv = store::topic_list(&app).unwrap_or_default().into_iter().find(|t| t.key == key).map(|t| t.interval_secs).unwrap_or(0);
+    println!("[selftest-rss-ui] 2) 改 {}: 界面改间隔后 = {}s（期望 900）", if iv == 900 { "OK" } else { "FAIL" }, iv);
+
+    // 4) 查：界面展开「条目」
+    let _ = win.eval(&("(function(){ var b = document.getElementById('c96-rss-docs-".to_string() + &key + "'); if (b) { b.click(); } })();"));
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    let _ = win.eval(&("(function(){ var box = document.getElementById('c96-rss-items-".to_string() + &key
+        + "'); })();"));
+    let box_js = "document.getElementById('c96-rss-items-".to_string() + &key + "')";
+    let probe_items = "'条目行=' + (".to_string() + &box_js + " ? " + &box_js + ".children.length : -1) + ' 首行=' + (" + &box_js + " ? " + &box_js + ".textContent.slice(0, 70) : '')";
+    let _ = win.eval(&post_js(&probe_items));
+    std::thread::sleep(std::time::Duration::from_millis(700));
+
+    // 4a) 全部内容区：真渲染 + 过滤（UI 输入框触发 250ms 防抖 reload）
+    let _ = win.eval("window.__C96_RSS_UI__ && window.__C96_RSS_UI__.reload();");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let _ = win.eval(&post_js("'全部内容行=' + document.querySelectorAll('#c96-rss-docs > div').length + ' 计数=' + (document.getElementById('c96-rss-dcount') ? document.getElementById('c96-rss-dcount').textContent : '-') + ' 主机行=' + document.querySelectorAll('#c96-rss-hosts > div').length + ' 来源行按钮=' + document.querySelectorAll('#c96-rss-sources > div button').length"));
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let _ = win.eval("(function(){ var el = document.getElementById('c96-rss-dq'); if (el) { el.value = 'C96JUNK-A'; el.dispatchEvent(new Event('input')); } })();");
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+    let _ = win.eval(&post_js("'过滤 C96JUNK-A 后 行=' + document.querySelectorAll('#c96-rss-docs > div').length + ' 计数=' + (document.getElementById('c96-rss-dcount') ? document.getElementById('c96-rss-dcount').textContent : '-')"));
+    std::thread::sleep(std::time::Duration::from_millis(700));
+
+    // 4b) 逐条删：界面两次点击（第一次变「确认?」）
+    let del_row = "(function(){ var row = document.querySelector('#c96-rss-docs > div'); if (!row) { return 'norow'; } var bs = row.querySelectorAll('button'); if (!bs.length) { return 'nobtn'; } bs[bs.length - 1].click(); return 'clicked'; })();";
+    // 点击驱动必须是裸 eval（post_js 会把表达式包进 String(...)，带 ; 的 IIFE 会解析失败）
+    let _ = win.eval(del_row);
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    let _ = win.eval(del_row);
+    std::thread::sleep(std::time::Duration::from_millis(2200));
+    let left_a = store::docs_all(&app, "C96JUNK-A", false, 300).ok()
+        .and_then(|v| v.get("shown").and_then(|x| x.as_u64())).unwrap_or(1);
+    println!("[selftest-rss-ui] 4b) 逐条删（UI） {}: C96JUNK-A 剩余 {} 条", if left_a == 0 { "OK" } else { "FAIL" }, left_a);
+
+    // 4b2) RSS 端到端：删掉的条目必须立刻从 /rss/all.xml 消失（用户诉求就是 RSS 里别再出现）
+    let feed = rss_fetch("/rss/all.xml");
+    let feed_ok = !feed.contains("C96JUNK-A") && feed.contains("C96JUNK-B");
+    println!("[selftest-rss-ui] 4b2) feed 反映删除 {}: all.xml {} 字节 · 含已删的 A={} 含保留的 B={}",
+        if feed_ok { "OK" } else { "FAIL" }, feed.len(), feed.contains("C96JUNK-A"), feed.contains("C96JUNK-B"));
+
+    // 4c) 主机制「忽略」：忽略后同站点新页面直接 skip
+    let host_btn = |i: usize| -> String {
+        return format!("(function(){{ var rows = document.querySelectorAll('#c96-rss-hosts > div'); for (var k = 0; k < rows.length; k++) {{ var nm = rows[k].firstElementChild; if (nm && nm.textContent === '{}') {{ var bs = rows[k].querySelectorAll('button'); if (bs.length <= {}) {{ return 'nobtn'; }} bs[{}].click(); return 'clicked'; }} }} return 'no-row'; }})();", junk_host, i, i);
+    };
+    let _ = win.eval(&host_btn(1));
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+    let ig_on = store::ignored_hosts(&app).unwrap_or_default().iter().any(|h| h == junk_host);
+    let skip_msg = store::save(&app, "https://c96-junk.example.com/skip-probe", "C96JUNK-SKIP", "ignored host probe body", "", 0).unwrap_or_default();
+    println!("[selftest-rss-ui] 4c) 忽略站点 {}: 名单命中={} 新页面={}", if ig_on && skip_msg.starts_with("skip: ignored host") { "OK" } else { "FAIL" }, ig_on, skip_msg);
+
+    // 4d) 取消忽略：应当恢复收录
+    let _ = win.eval(&host_btn(1));
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+    let ig_off = !store::ignored_hosts(&app).unwrap_or_default().iter().any(|h| h == junk_host);
+    let again_msg = store::save(&app, "https://c96-junk.example.com/skip-probe", "C96JUNK-SKIP", "ignored host probe body", "", 0).unwrap_or_default();
+    println!("[selftest-rss-ui] 4d) 取消忽略 {}: 名单已空={} 再存={}", if ig_off && again_msg.starts_with("stored:") { "OK" } else { "FAIL" }, ig_off, again_msg);
+
+    // 4e) 主机制「清空」：两次点击 -> 该站点内容归零
+    let keep_btn = format!("(function(){{ var rows = document.querySelectorAll('#c96-rss-hosts > div'); for (var k = 0; k < rows.length; k++) {{ var nm = rows[k].firstElementChild; if (nm && nm.textContent === '{}') {{ var bs = rows[k].querySelectorAll('button'); if (!bs.length) {{ return 'nobtn'; }} bs[0].click(); return 'clicked'; }} }} return 'no-row'; }})();", keep_host);
+    let _ = win.eval(&keep_btn);
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    let _ = win.eval(&keep_btn);
+    std::thread::sleep(std::time::Duration::from_millis(2200));
+    let kept_left = store::docs_all(&app, keep_host, false, 300).ok()
+        .and_then(|v| v.get("shown").and_then(|x| x.as_u64())).unwrap_or(1);
+    println!("[selftest-rss-ui] 4e) 清空主机 {}: 剩余 {} 条", if kept_left == 0 { "OK" } else { "FAIL" }, kept_left);
+
+    // 5) 删：界面两次点击（第一次变「确认删除?」）
+    let del_js = "(function(){ var b = document.getElementById('c96-rss-del-".to_string() + &key + "'); if (b) { b.click(); } })();";
+    let _ = win.eval(&del_js);
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    let _ = win.eval(&del_js);
+    std::thread::sleep(std::time::Duration::from_millis(2600));
+    let gone = !store::topic_list(&app).unwrap_or_default().iter().any(|t| t.key == key);
+    println!("[selftest-rss-ui] 3) 删 {}: 订阅已{}", if gone { "OK" } else { "FAIL" }, if gone { "移除" } else { "仍存在" });
+
+    // 6) 真站回归：外部 https 页面（Bing）上图标/面板同样可用
+    let _ = browser::raw_navigate(&app, "main", "https://www.bing.com/");
+    std::thread::sleep(std::time::Duration::from_secs(7));
+    let _ = win.eval(&post_js("'bing bar=' + !!document.getElementById('c96-bar') + ' btn=' + !!document.getElementById('c96-rss-btn')"));
+    let _ = win.eval("document.getElementById('c96-rss-btn') && document.getElementById('c96-rss-btn').click();");
+    std::thread::sleep(std::time::Duration::from_millis(4000));
+    let _ = win.eval(&post_js("'bing panel=' + (document.getElementById('c96-rss-panel') ? document.getElementById('c96-rss-panel').style.display : 'missing') + ' 订阅行=' + document.querySelectorAll('#c96-rss-topics > div').length + ' 状态=' + (document.getElementById('c96-rss-status') ? document.getElementById('c96-rss-status').textContent : '-')"));
+    std::thread::sleep(std::time::Duration::from_millis(700));
+
+    // 7) 面板上报 + 清理自检条目（顺便验证「删条目」）
+    for e in browser::list_events().iter().filter(|e| e.kind == "rss-ui" || e.kind == "rss-op") {
+        println!("[selftest-rss-ui] ui> {}", e.detail);
+    }
+    let mut removed = 0;
+    for r in store::topic_docs(&app, q, 50).unwrap_or_default().iter() {
+        if store::doc_remove(&app, &r.0).unwrap_or(false) { removed += 1; }
+    }
+    println!("[selftest-rss-ui] 清理自检条目 = {}（KB 现有 {} 条）", removed,
+        store::stats(&app).map(|s| s.docs).unwrap_or(0));
+    let junk_left = store::host_remove(&app, junk_host).unwrap_or(0) + store::host_remove(&app, keep_host).unwrap_or(0);
+    let _ = store::ignore_host(&app, junk_host, false);
+    let _ = store::ignore_host(&app, keep_host, false);
+    println!("[selftest-rss-ui] 清理随手收录 = {} 条 · 忽略名单 = {:?} · KB 现有 {} 条",
+        junk_left, store::ignored_hosts(&app).unwrap_or_default(), store::stats(&app).map(|s| s.docs).unwrap_or(0));
+    println!("[selftest-rss-ui] done");
+    app.exit(0);
+}
+
+fn tail_url(u: &str) -> String {
+    let s = u.rsplit('/').next().unwrap_or(u);
+    let s = if s.is_empty() { u } else { s };
+    return s.chars().take(90).collect();
+}
+
+/// 链接点击自检：用户反馈"点搜索结果没反应"。
+/// 本地页面里放三种链接（普通 / target=_blank / window.open），逐一点击看窗口 URL 有没有变。
+fn run_selftest_links(app: tauri::AppHandle) {
+    println!("[selftest-links] start");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let dir = std::env::temp_dir().join("c96_links");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("target.html"),
+        "<!doctype html><meta charset=utf-8><title>C96 target</title><body><h1>target page</h1></body>");
+    let _ = std::fs::write(dir.join("links.html"),
+        "<!doctype html><meta charset=utf-8><title>C96 links</title><body>\
+         <a id=\"plain\" href=\"target.html\">plain</a>\
+         <a id=\"blank\" href=\"target.html?kind=blank\" target=\"_blank\">blank</a>\
+         <button id=\"pop\" onclick=\"window.open('target.html?kind=pop','_blank')\">pop</button>\
+         </body>");
+    let page_url = format!("file:///{}", dir.join("links.html").to_string_lossy().replace('\\', "/"));
+    let win = match app.get_webview_window("main") {
+        Some(w) => w,
+        None => { println!("[selftest-links] 主窗口不存在"); app.exit(0); return; }
+    };
+    let cases: [(&str, &str); 3] = [
+        ("plain", "document.getElementById('plain').click();"),
+        ("blank", "document.getElementById('blank').click();"),
+        ("pop", "document.getElementById('pop').click();"),
+    ];
+    let mut pass = 0;
+    for (name, js) in cases {
+        match browser::raw_navigate(&app, "main", &page_url) {
+            Ok(_) => {}
+            Err(e) => println!("[selftest-links] navigate ERR: {}", e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1600));
+        let before = win.url().map(|u| u.to_string()).unwrap_or_default();
+        let loaded = before.contains("links.html");
+        let _ = win.eval(js);
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        let after = win.url().map(|u| u.to_string()).unwrap_or_default();
+        let ok = loaded && after.contains("target.html");
+        if ok { pass += 1; }
+        println!("[selftest-links] {:<5} 页面就绪={} {} -> {} => {}",
+            name, loaded, tail_url(&before), tail_url(&after), if ok { "OK 打开了" } else { "FAIL 没反应" });
+    }
+    // 真站：Bing 结果页第一枚结果
+    match browser::raw_navigate(&app, "main", "https://www.bing.com/search?q=%E5%8D%A1%E6%99%AE%E7%A9%BA") {
+        Ok(_) => {}
+        Err(e) => println!("[selftest-links] bing navigate ERR: {}", e),
+    }
+    std::thread::sleep(std::time::Duration::from_secs(7));
+    let before = win.url().map(|u| u.to_string()).unwrap_or_default();
+    let _ = win.eval("(function(){var a=document.querySelectorAll('#b_results h2 a')[0]; if(a){a.click();}})();");
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    let after = win.url().map(|u| u.to_string()).unwrap_or_default();
+    let bing_ok = before.contains("bing.com") && !after.contains("bing.com");
+    println!("[selftest-links] bing  {} -> {} => {}", tail_url(&before), tail_url(&after),
+        if bing_ok { "OK 结果页点开了" } else { "FAIL 结果页点击无反应" });
+    println!("[selftest-links] 小结: 本地 3 例通过 {}/3，Bing 结果页 {}", pass, if bing_ok { "通过" } else { "失败" });
+    println!("[selftest-links] done");
+    app.exit(0);
+}
+
+fn topic_runs(app: &tauri::AppHandle, q: &str) -> u64 {
+    let key = c96::store::state::topic_key(q);
+    match store::topic_list(app) {
+        Ok(v) => v.into_iter().find(|t| t.key == key).map(|t| t.runs).unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+/// I 无人值守自检：
+///   1) 首次查询 -> 立刻搜索 + 建任务（state=new）
+///   2) 再查询   -> 命中 RAG，不联网（runs 不增加、耗时可忽略）
+///   3) 回拨 7h  -> stale：先返回旧数据，同时后台刷新（runs 增加）
+///   4) 任务清单持久化（state.toml 的 [[topic]]）
+fn run_selftest_topics(app: tauri::AppHandle) {
+    println!("[selftest-topics] start");
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    let q = "c96 topic selftest 卡普空";
+    match store::topic_query(&app, q, false) {
+        Ok(r) => println!("[selftest-topics] 1) 首搜: state={} from_cache={} hits={} run={} topic_runs={} stored={}",
+            r.state, r.from_cache, r.hits.len(), r.run.is_some(), r.topic.runs, r.topic.stored),
+        Err(e) => println!("[selftest-topics] 1) ERR: {}", e),
+    }
+    let runs1 = topic_runs(&app, q);
+    let t0 = std::time::Instant::now();
+    match store::topic_query(&app, q, false) {
+        Ok(r) => println!("[selftest-topics] 2) 命中: state={} from_cache={} hits={} run={} elapsed={}ms",
+            r.state, r.from_cache, r.hits.len(), r.run.is_some(), t0.elapsed().as_millis()),
+        Err(e) => println!("[selftest-topics] 2) ERR: {}", e),
+    }
+    let runs2 = topic_runs(&app, q);
+    println!("[selftest-topics] 2b) runs {} -> {}（命中不得增加；耗时 {}ms）", runs1, runs2, t0.elapsed().as_millis());
+    match store::topic_backdate(&app, q, 7 * 3600) {
+        Ok(b) => println!("[selftest-topics] 3) 回拨 7h -> {}", b),
+        Err(e) => println!("[selftest-topics] 3) ERR: {}", e),
+    }
+    match store::topic_query(&app, q, false) {
+        Ok(r) => println!("[selftest-topics] 3b) 太旧: state={} from_cache={} hits={} pending={:?}",
+            r.state, r.from_cache, r.hits.len(), r.pending),
+        Err(e) => println!("[selftest-topics] 3b) ERR: {}", e),
+    }
+    let mut waited: u64 = 0;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        waited += 1;
+        let now_runs = topic_runs(&app, q);
+        if now_runs > runs2 {
+            println!("[selftest-topics] 4) 后台刷新完成: runs {} -> {}（等待 {}s）", runs2, now_runs, waited);
+            break;
+        }
+        if waited >= 45 {
+            println!("[selftest-topics] 4) 后台刷新超时（runs 仍为 {}）", now_runs);
+            break;
+        }
+    }
+    match store::topic_list(&app) {
+        Ok(ts) => {
+            println!("[selftest-topics] 5) 任务清单: {} 个", ts.len());
+            for t in ts.iter().take(6) { println!("  {}", topic_line(t)); }
+        }
+        Err(e) => println!("[selftest-topics] 5) ERR: {}", e),
+    }
+    println!("[selftest-topics] done");
+    app.exit(0);
+}
+
+fn main() {
+    let selftest = std::env::args().any(|a| a == "--selftest");
+    let selftest_topics = std::env::args().any(|a| a == "--selftest-topics");
+    let selftest_rag = std::env::args().any(|a| a == "--selftest-rag");
+    let selftest_links = std::env::args().any(|a| a == "--selftest-links");
+    let selftest_rss_ui = std::env::args().any(|a| a == "--selftest-rss-ui");
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            banner,
+            open_browser,
+            snapshot_probe,
+            webview2_info,
+            webview2_zoom,
+            webview2_navigate,
+            browser_event,
+            browser_events,
+            browser_events_clear,
+            kb_stats,
+            kb_search,
+            kb_purge,
+            topic_query,
+            topic_list,
+            topic_run,
+            topic_remove,
+            topic_backdate,
+            topic_update,
+            topic_docs,
+            rss_sources,
+            rss_doc_remove,
+            rss_base
+        ])
+        .setup(move |app| {
+            let handle = app.handle().clone();
+            // 默认（含 --selftest）：主窗口 = 对外浏览器，先 about:blank，装好接收器再导航。
+            if let Err(e) = browser::open_main(&handle, "about:blank") {
+                println!("[c96] open_main ERR: {}", e);
+            }
+            let boot = handle.clone();
+            std::thread::spawn(move || boot_main(boot));
+            if selftest {
+                let h = handle.clone();
+                std::thread::spawn(move || run_selftest(h));
+            }
+            if selftest_rag {
+                let h = handle.clone();
+                std::thread::spawn(move || run_selftest_rag(h));
+            }
+            if selftest_topics {
+                let h = handle.clone();
+                std::thread::spawn(move || run_selftest_topics(h));
+            }
+            if selftest_links {
+                let h = handle.clone();
+                std::thread::spawn(move || run_selftest_links(h));
+            }
+            if selftest_rss_ui {
+                let h = handle.clone();
+                std::thread::spawn(move || run_selftest_rss_ui(h));
+            }
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running C96 GUI");
+}

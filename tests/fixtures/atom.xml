@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Example Atom Feed</title>
+  <link href="https://atom.example.org/"/>
+  <link rel="self" href="https://atom.example.org/feed"/>
+  <subtitle>A test Atom feed</subtitle>
+  <updated>2024-01-01T00:00:00Z</updated>
+  <language>en</language>
+  <entry>
+    <title>Atom Entry One</title>
+    <link rel="alternate" href="https://atom.example.org/one"/>
+    <link rel="self" href="https://atom.example.org/feed"/>
+    <content type="html">&lt;p&gt;Atom body one&lt;/p&gt;</content>
+    <published>2024-01-01T00:00:00Z</published>
+    <author><name>Alice</name></author>
+  </entry>
+  <entry>
+    <title>Atom Entry Two</title>
+    <link rel="alternate" href="https://atom.example.org/two"/>
+    <content type="html">&lt;p&gt;Atom body two&lt;/p&gt;</content>
+    <updated>2024-01-02T00:00:00Z</updated>
+  </entry>
+  <entry>
+    <title>Atom Entry Three</title>
+    <link rel="alternate" href="https://atom.example.org/three"/>
+    <content type="html">&lt;p&gt;Atom body three&lt;/p&gt;</content>
+    <published>2024-01-03T00:00:00Z</published>
+  </entry>
+  <entry>
+    <title>Atom Entry Four</title>
+    <link rel="alternate" href="https://atom.example.org/four"/>
+    <content type="html">&lt;p&gt;Atom body four&lt;/p&gt;</content>
+    <published>2024-01-04T00:00:00Z</published>
+  </entry>
+  <entry>
+    <title>Atom Entry Five</title>
+    <link rel="alternate" href="https://atom.example.org/five"/>
+    <content type="html">&lt;p&gt;Atom body five&lt;/p&gt;</content>
+    <published>2024-01-05T00:00:00Z</published>
+  </entry>
+</feed>

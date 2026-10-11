@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Rust 1.97 发布：编译器与 Cargo 的新变化 - 技术观察</title>
+<meta property="og:title" content="Rust 1.97 发布：编译器与 Cargo 的新变化">
+<style>body { font-family: sans-serif; } .nav { display: flex; }</style>
+<script>window.__tracker = { id: 42 }; console.log("analytics");</script>
+</head>
+<body>
+<header class="site-header">
+  <nav class="site-nav">
+    <a href="/">首页</a> <a href="/rust">Rust</a> <a href="/about">关于我们</a>
+  </nav>
+</header>
+<div class="layout">
+  <main class="main-column">
+    <article class="post-content">
+      <h1>Rust 1.97 发布：编译器与 Cargo 的新变化</h1>
+      <p class="byline">作者：张三 · 2026-07-07</p>
+      <p>Rust 1.97 稳定版已经发布，本次更新聚焦在编译器诊断信息的可读性与 Cargo 构建缓存的命中率上。对于每天都要 <code>cargo build</code> 的开发者来说，这些改动能明显缩短等待时间。</p>
+      <p>在语言层面，1.97 继续收紧了若干边缘语法的检查，例如重复的 where 子句和未使用的生命周期参数，现在都会给出更精确的提示。标准库方面，一批与文件系统和网络相关的 API 得到了稳定性提升。</p>
+      <p>Cargo 的增量编译缓存现在会记录更多依赖指纹，当只有注释或文档发生变化时，重建范围会显著缩小。团队表示，后续还会继续优化链接阶段的并行度。</p>
+      <blockquote>升级建议：先在小规模 CI 上验证，再滚动到主分支。&amp; 记得检查第三方 crate 的兼容性。</blockquote>
+      <pre><code>fn main() { println!("hello rust 1.97"); }</code></pre>
+    </article>
+  </main>
+  <aside class="sidebar related">
+    <h2>相关阅读</h2>
+    <ul>
+      <li><a href="/post/1">Rust 语言服务器性能调优</a></li>
+      <li><a href="/post/2">Cargo 工作区最佳实践</a></li>
+    </ul>
+  </aside>
+</div>
+<section class="comments">
+  <h2>评论（2）</h2>
+  <p>用户 A：这次更新太及时了。</p>
+  <p>用户 B：希望文档也一起更新。</p>
+</section>
+<footer class="site-footer copyright">
+  <p>版权所有 2026 技术观察 · 京ICP备00000000号</p>
+</footer>
+</body>
+</html>

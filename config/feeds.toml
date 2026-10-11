@@ -1,0 +1,44 @@
+# C96 用户偏好 — 阶段 B schema（[default] 全局默认 + [[feeds]] 每订阅）
+# 字段：url, engine(bing|baidu|auto), site, keywords[], weight(0,10], max_age_hours, blacklist[], enabled, note
+# 解析：手写 TOML subset（src/config/toml.rs）— 无外部 dep
+
+[default]
+engine = "auto"
+weight = 1.0
+max_age_hours = 48
+blacklist = ["doubleclick.net", "googleadservices.com", "qq.com/ad"]
+
+[[feeds]]
+name = "bing-news-rust"
+url = "https://www.bing.com/news/search?q=rust+compiler&format=rss"
+engine = "bing"
+keywords = ["rust 编译器", "cargo 构建", "语言 服务器"]
+site = "bing.com"
+weight = 2.5
+max_age_hours = 24
+note = "Bing News RSS — 反爬强度低，HTTP 直取（阶段 C）"
+
+[[feeds]]
+name = "bing-serp-zh"
+url = "https://www.bing.com/search?q=rust+%E7%BB%9C%E6%96%87&setlang=zh-CN"
+engine = "bing"
+keywords = ["rust 语言"]
+weight = 1.5
+blacklist = ["baidu.com", "csdn.net"]
+note = "Bing SERP HTML <li class=b_algo> + ck/a 跳转解码（阶段 D）"
+
+[[feeds]]
+name = "baidu-serp"
+url = "https://www.baidu.com/s?wd=rust%20compiler&rn=20"
+engine = "baidu"
+keywords = ["rust 编译器"]
+weight = 1.0
+max_age_hours = 12
+note = "Baidu SERP — 高反爬：BAIDUID cookie + ClickUrl 解包 + browser layer（阶段 E）"
+
+[[feeds]]
+name = "example-atom"
+url = "https://example.com/feed.atom"
+engine = "auto"
+enabled = false
+note = "disabled 示例：refresh 跳过，list 仍显示"

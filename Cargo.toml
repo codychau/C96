@@ -1,0 +1,25 @@
+[package]
+name = "C96"
+version = "0.1.0"
+edition = "2021"
+description = "资讯聚合 -> RSS-like 订阅 -> 完整索引 -> 本地 AI 知识库 (RAG)"
+
+# 阶段 F：lib target 暴露 core（config/fetch/search/store），供 GUI crate 复用存储层。
+[lib]
+name = "c96"
+path = "src/lib.rs"
+
+[[bin]]
+name = "C96"
+path = "src/main.rs"
+
+# 阶段 B 修订 2026-10-07：TOML 层 = official toml crate（full spec 1.1）。
+# 手写 parser/writer 已删除；see RUST/TASKS.md 阶段 B 记录。
+# 阶段 C 修订 2026-10-07：C2 feed 解析 = xml-rs 0.8.29（零依赖，离线 crate 已缓存）。
+# 阶段 F 修订 2026-10-11：存储层 = serde + serde_json（JSONL 文档；registry 已缓存可离线）。
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1.6"
+ureq = "2.12.1"   # C1 HTTP client (rustls + ring; TLS tree fetched once)
+xml-rs = "0.8.29" # C2 RSS 2.0 + Atom parser (dependency-free, offline cached)

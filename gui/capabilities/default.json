@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "C96 GUI 默认能力：main 外壳窗口 + browser 自控窗口",
+  "windows": ["main", "browser"],
+  "permissions": ["core:default"]
+}

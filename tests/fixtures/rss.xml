@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Example RSS Feed</title>
+    <link>https://example.com/</link>
+    <description>A test RSS 2.0 feed</description>
+    <language>en-us</language>
+    <item>
+      <title>RSS Item One</title>
+      <link>https://example.com/one</link>
+      <description>Body of item one with &amp; entities.</description>
+      <pubDate>Mon, 01 Jan 2024 10:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>RSS Item Two</title>
+      <link>https://example.com/two</link>
+      <content:encoded><![CDATA[<p>HTML body of item two</p>]]></content:encoded>
+      <pubDate>Tue, 02 Jan 2024 10:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>RSS Item Three</title>
+      <link>https://example.com/three</link>
+      <description>Item three body.</description>
+      <pubDate>Wed, 03 Jan 2024 10:00:00 GMT</pubDate>
+      <guid>https://example.com/three</guid>
+    </item>
+    <item>
+      <title>RSS Item Four</title>
+      <link>https://example.com/four</link>
+      <description>Item four body.</description>
+      <pubDate>Thu, 04 Jan 2024 10:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>RSS Item Five</title>
+      <link>https://example.com/five</link>
+      <description>Item five body.</description>
+      <pubDate>Fri, 05 Jan 2024 10:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>RSS Item Six</title>
+      <link>https://example.com/six</link>
+      <description>Item six body.</description>
+      <pubDate>Sat, 06 Jan 2024 10:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

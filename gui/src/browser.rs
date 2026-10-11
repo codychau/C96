@@ -1,0 +1,1290 @@
+//! E1/E2：自控窗口（self-controlled browsing surface）。
+//!
+//! Tauri v2 在 Windows 上默认 WebView2。本模块负责：
+//!   1. 打开 label=browser 的第二个 WebView2 窗口，加载用户给出的 URL
+//!   2. initialization_script 注入快照钩子 + 事件钩子（等价 WebView2
+//!      AddScriptToExecuteOnDocumentCreated；E3 的 JS 抽取入口）
+//!   3. on_navigation / on_page_load 记录用户点击/跳转/加载
+//!   4. 通过 Webview::with_webview 拿 PlatformWebview → webview2-com
+//!      ICoreWebView2Controller / ICoreWebView2，裸读状态、缩放、导航
+//!   5. E2：AddWebMessageReceived 接收页面里 window.chrome.webview.postMessage
+//!      发回的点击/SPA 事件，写进事件日志并 emit browser://event
+//!
+//! 事件走 WebView2 原生 postMessage（不依赖 Tauri IPC 的远端 origin 策略），
+//! 便于 E3 回传「终态 DOM 抽取」的大结构化体。
+
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+use tauri::AppHandle;
+use tauri::Emitter;
+use tauri::Manager;
+use tauri::WebviewUrl;
+use tauri::WebviewWindow;
+use tauri::WebviewWindowBuilder;
+
+/// 事件记录（E2）：点击 / 跳转 / 加载 / SPA / 页面主动上报。
+#[derive(Clone, serde::Serialize)]
+pub struct BrowserEvent {
+    pub seq: u64,
+    pub kind: String,
+    pub url: String,
+    pub detail: String,
+    pub at_ms: u128,
+}
+
+static EVENTS: OnceLock<Mutex<Vec<BrowserEvent>>> = OnceLock::new();
+
+fn events() -> &'static Mutex<Vec<BrowserEvent>> {
+    return EVENTS.get_or_init(|| Mutex::new(Vec::new()));
+}
+
+static CURRENT_QUERY: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn query_cell() -> &'static Mutex<String> {
+    return CURRENT_QUERY.get_or_init(|| Mutex::new(String::new()));
+}
+
+pub fn set_query(q: &str) {
+    let mut g = query_cell().lock().unwrap_or_else(|e| e.into_inner());
+    *g = q.to_string();
+}
+
+pub fn current_query() -> String {
+    let g = query_cell().lock().unwrap_or_else(|e| e.into_inner());
+    return g.clone();
+}
+
+fn now_ms() -> u128 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => return d.as_millis(),
+        Err(_) => return 0,
+    }
+}
+
+/// 追加一条事件到日志，并广播给前端（browser://event）。
+pub fn record(app: &AppHandle, kind: &str, url: &str, detail: &str) {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let ev = BrowserEvent {
+        seq: SEQ.fetch_add(1, Ordering::Relaxed),
+        kind: kind.to_string(),
+        url: url.to_string(),
+        detail: detail.to_string(),
+        at_ms: now_ms(),
+    };
+    {
+        let mut v = events().lock().unwrap_or_else(|e| e.into_inner());
+        v.push(ev.clone());
+        let len = v.len();
+        if len > 500 {
+            v.drain(0..len - 500);
+        }
+    }
+    let _ = app.emit("browser://event", &ev);
+}
+
+/// 生成把结果回送页面的脚本：window.__C96_RSS_UI__.reply(id, ok, json)
+fn rss_reply_js(id: &str, ok: bool, payload: &str) -> String {
+    let id_lit = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string());
+    let data_lit = serde_json::to_string(payload).unwrap_or_else(|_| "\"\"".to_string());
+    return "(function(){ var t = window.__C96_RSS_UI__; if (t && t.reply) { t.reply(".to_string()
+        + &id_lit + ", " + (if ok { "true" } else { "false" }) + ", " + &data_lit + "); } })();";
+}
+
+/// 解析页面 postMessage 的 JSON 负载。
+pub fn ingest(app: &AppHandle, raw: &str) {
+    let v: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => {
+            record(app, "message", "", raw);
+            return;
+        }
+    };
+    let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("message");
+    let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("");
+    let detail = v.get("detail").and_then(|x| x.as_str()).unwrap_or("");
+    if kind == "search" {
+        set_query(detail);
+        record(app, "search", url, detail);
+        return;
+    }
+    if kind == "capture" {
+        let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("");
+        let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+        let q = current_query();
+        match crate::store::save(app, url, title, text, &q, 200) {
+            Ok(msg) => record(app, "store", url, &msg),
+            Err(e) => record(app, "store-error", url, &e),
+        }
+        return;
+    }
+    if kind == "rss" {
+        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let args = v.get("args").cloned().unwrap_or(serde_json::Value::Null);
+        let app2 = app.clone();
+        // 不能在 webview 事件回调里同步 eval（可能自锁），丢到线程里算完再回送
+        std::thread::spawn(move || {
+            let (ok, payload, note) = match crate::store::rss_op(&app2, &op, &args) {
+                Ok(val) => (true, val.to_string(), "ok".to_string()),
+                Err(e) => (false, serde_json::Value::String(e.clone()).to_string(), e),
+            };
+            record(&app2, "rss-op", &op, &note);
+            if let Some(w) = app2.get_webview_window("main") {
+                let _ = w.eval(&rss_reply_js(&id, ok, &payload));
+            }
+        });
+        return;
+    }
+    record(app, kind, url, detail);
+}
+
+pub fn list_events() -> Vec<BrowserEvent> {
+    let v = events().lock().unwrap_or_else(|e| e.into_inner());
+    return v.clone();
+}
+
+pub fn clear_events() -> usize {
+    let mut v = events().lock().unwrap_or_else(|e| e.into_inner());
+    let n = v.len();
+    v.clear();
+    return n;
+}
+
+/// 注入到自控窗口每次文档创建的钩子（E3 快照壳的 E1 版本）。
+pub const SNAPSHOT_INIT: &str = r##"(function () {
+  if (window.__C96_SNAPSHOT__) { return; }
+  var api = { version: 1, installedAt: Date.now() };
+  api.capture = function () {
+    var doc = document;
+    var links = [];
+    if (doc.querySelectorAll) {
+      var nodes = doc.querySelectorAll("a[href]");
+      for (var i = 0; i < nodes.length && i < 200; i++) {
+        links.push({ href: nodes[i].href, text: (nodes[i].textContent || "").trim().slice(0, 120) });
+      }
+    }
+    return {
+      title: doc.title,
+      url: location.href,
+      readyState: doc.readyState,
+      text: doc.body ? doc.body.innerText : "",
+      html: doc.documentElement ? doc.documentElement.outerHTML : "",
+      links: links
+    };
+  };
+  api.done = function () { return !!(document.readyState === "complete"); };
+  window.__C96_SNAPSHOT__ = api;
+})();"##;
+
+/// E2：事件钩子。点击 / SPA / ready 通过 WebView2 原生 postMessage 回传。
+pub const EVENTS_INIT: &str = r##"(function () {
+  if (window.__C96_EVENTS__) { return; }
+  window.__C96_EVENTS__ = true;
+  function post(type, detail) {
+    var payload = JSON.stringify({ type: type, url: location.href, detail: detail });
+    try {
+      if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+        window.chrome.webview.postMessage(payload);
+        return;
+      }
+    } catch (e) {}
+    try {
+      if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
+        window.__TAURI_INTERNALS__.invoke("browser_event", { payload: payload });
+      }
+    } catch (e) {}
+  }
+  function describe(el) {
+    if (!el || !el.tagName) { return ""; }
+    var t = el.tagName.toLowerCase();
+    var txt = (el.innerText || el.textContent || "").trim().slice(0, 80);
+    var href = el.href || "";
+    return t + " | " + href + " | " + txt;
+  }
+  document.addEventListener("click", function (e) {
+    var a = null;
+    if (e.target && e.target.closest) { a = e.target.closest("a"); }
+    post("click", describe(a || e.target));
+  }, true);
+  window.addEventListener("hashchange", function () { post("spa", "hashchange"); });
+  window.addEventListener("popstate", function () { post("spa", "popstate"); });
+  var last = location.href;
+  setInterval(function () {
+    if (location.href !== last) { last = location.href; post("spa", "url-changed"); }
+  }, 800);
+  post("ready", document.title);
+})();"##;
+/// E6：链接点击修正 —— WebView2 默认**丢弃**新窗口请求，导致 target=_blank / window.open 点击"没反应"。
+/// 统一改写成当前窗口导航（单窗口浏览器语义），这样结果页链接一点就开，且自动 RAG 采集照常工作。
+pub const LINKS_INIT: &str = r##"(function () {
+  if (window.__C96_LINKS__) { return; }
+  window.__C96_LINKS__ = true;
+  function selfTarget(el) {
+    if (!el || !el.getAttribute) { return; }
+    var t = (el.getAttribute("target") || "").toLowerCase();
+    if (t && t !== "_self" && t !== "_top" && t !== "_parent") { el.setAttribute("target", "_self"); }
+  }
+  document.addEventListener("click", function (e) {
+    var a = null;
+    try { if (e.target && e.target.closest) { a = e.target.closest("a"); } } catch (err) {}
+    if (a) { selfTarget(a); }
+  }, true);
+  document.addEventListener("auxclick", function (e) {
+    if (e.button !== 1) { return; }
+    var a = null;
+    try { if (e.target && e.target.closest) { a = e.target.closest("a"); } } catch (err) {}
+    if (a && a.href) { e.preventDefault(); location.href = a.href; }
+  }, true);
+  document.addEventListener("submit", function (e) { selfTarget(e.target); }, true);
+  var origOpen = window.open;
+  window.open = function (url) {
+    try {
+      if (url) { location.href = String(url); }
+    } catch (err) {}
+    return null;
+  };
+})();"##;
+
+/// E3：主窗口叠加条 —— C96 搜索/网址输入 + 页面加载后自动 capture 回传 Rust 入库。
+pub const OVERLAY_INIT: &str = r##"(function () {
+  if (window.__C96_BAR__) { return; }
+  window.__C96_BAR__ = true;
+  function post(type, detail, extra) {
+    var payload = { type: type, url: location.href, detail: detail };
+    if (extra) { for (var k in extra) { if (extra.hasOwnProperty(k)) { payload[k] = extra[k]; } } }
+    var s = JSON.stringify(payload);
+    try {
+      if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+        window.chrome.webview.postMessage(s);
+        return;
+      }
+    } catch (e) {}
+    try {
+      if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
+        window.__TAURI_INTERNALS__.invoke("browser_event", { payload: s });
+      }
+    } catch (e) {}
+  }
+  function installBar() {
+    if (document.getElementById("c96-bar")) { return; }
+    var bar = document.createElement("div");
+    bar.id = "c96-bar";
+    bar.setAttribute("style", "position:fixed;top:0;left:0;right:0;height:46px;z-index:2147483647;background:#14161a;border-bottom:1px solid #2a2e36;display:flex;align-items:center;gap:8px;padding:0 10px;font:13px/1.4 system-ui,Segoe UI,sans-serif;box-sizing:border-box;");
+    var label = document.createElement("span");
+    label.textContent = "C96";
+    label.setAttribute("style", "color:#93c5fd;font-weight:700;letter-spacing:.5px;");
+    var input = document.createElement("input");
+    input.id = "c96-q";
+    input.type = "text";
+    input.placeholder = "输入搜索内容或网址，回车（加载后自动存入 RAG 知识库）";
+    input.setAttribute("style", "flex:1;height:32px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 10px;font:inherit;outline:none;");
+    var status = document.createElement("span");
+    status.id = "c96-status";
+    status.textContent = "就绪";
+    status.setAttribute("style", "color:#9aa4b2;font-size:12px;max-width:260px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
+    input.addEventListener("keydown", function (e) {
+      if (e.key !== "Enter") { return; }
+      var q = input.value.trim();
+      if (!q) { return; }
+      post("search", q);
+      status.textContent = "搜索中…";
+      if (q.indexOf("http://") === 0 || q.indexOf("https://") === 0) {
+        location.href = q;
+      } else {
+        location.href = "https://www.bing.com/search?q=" + encodeURIComponent(q);
+      }
+    });
+    bar.appendChild(label);
+    bar.appendChild(input);
+    bar.appendChild(status);
+    // RSS 内容管理器：顶部工具栏图标 -> 弹层（增删改查）
+    var rssBtn = document.createElement("button");
+    rssBtn.id = "c96-rss-btn";
+    rssBtn.type = "button";
+    rssBtn.title = "RSS 内容管理器（增删改查）";
+    rssBtn.setAttribute("style", "display:flex;align-items:center;gap:4px;height:30px;padding:0 8px;background:#1c2027;color:#f59e0b;border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
+    rssBtn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2.4" stroke-linecap="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1.5" fill="#f59e0b" stroke="none"/></svg>';
+    var rssLabel = document.createElement("span");
+    rssLabel.textContent = "RSS";
+    rssBtn.appendChild(rssLabel);
+    rssBtn.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleRssPanel();
+    });
+    bar.appendChild(rssBtn);
+    var root = document.body || document.documentElement;
+    root.appendChild(bar);
+    try {
+      if (document.body && !document.body.style.paddingTop) { document.body.style.paddingTop = "46px"; }
+    } catch (e) {}
+    input.focus();
+  }
+  function capture() {
+    var bar = document.getElementById("c96-bar");
+    var status = document.getElementById("c96-status");
+    if (bar) { bar.style.display = "none"; }
+    var text = "";
+    try { text = document.body ? document.body.innerText : ""; } catch (e) {}
+    var title = document.title || "";
+    if (bar) { bar.style.display = "flex"; }
+    post("capture", "", { title: title, text: text });
+    if (status) { status.textContent = "已送存 " + String(text.length) + " 字"; }
+  }
+  function describe(el) {
+    if (!el || !el.tagName) { return ""; }
+    var txt = (el.innerText || el.textContent || "").trim().slice(0, 80);
+    return el.tagName.toLowerCase() + " | " + (el.href || "") + " | " + txt;
+  }
+  document.addEventListener("click", function (e) {
+    var a = null;
+    if (e.target && e.target.closest) { a = e.target.closest("a"); }
+    if (a) { post("click", describe(a)); }
+  }, true);
+  window.addEventListener("hashchange", function () { post("spa", "hashchange"); });
+  window.addEventListener("popstate", function () { post("spa", "popstate"); });
+  // ---- RSS 内容管理器（顶部工具栏图标 -> 弹层）：查列表 / 增订阅 / 改间隔 / 删订阅与条目 ----
+  var RSS_BASE = ["", "", ""];
+  var RSS_PENDING = {};
+  var RSS_SEQ = 0;
+  var RSS_DQ_TIMER = 0;
+  var RSS_OP = { topic_query: "topic_add", topic_list: "topics", rss_sources: "sources", rss_base: "base", topic_docs: "topic_docs", topic_run: "topic_run", topic_remove: "topic_remove", topic_update: "topic_update", rss_doc_remove: "doc_remove" };
+  function rssReply(id, ok, data) {
+    var p = RSS_PENDING[id];
+    if (!p) { return; }
+    delete RSS_PENDING[id];
+    var val = data;
+    try { val = JSON.parse(data); } catch (e) {}
+    if (ok) { p.ok(val); } else { p.bad(new Error(typeof val === "string" ? val : JSON.stringify(val))); }
+  }
+  // 外部网页 / file:// 的 Origin 不被 Tauri IPC 接受（实测 "Origin header is not a valid URL"），
+  // 所以走 WebView2 原生 postMessage：Rust 侧 rss_op() 算完用 eval 回送 reply()。
+  function ipc(cmd, args) {
+    var op = RSS_OP[cmd] || cmd;
+    return new Promise(function (resolve, reject) {
+      var id = "r" + (++RSS_SEQ);
+      var payload = JSON.stringify({ type: "rss", id: id, op: op, args: args || {} });
+      var sent = false;
+      try {
+        if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+          window.chrome.webview.postMessage(payload);
+          sent = true;
+        }
+      } catch (e) {}
+      if (!sent) { reject(new Error("没有可用的页面通道（需 WebView2）")); return; }
+      RSS_PENDING[id] = { ok: resolve, bad: reject };
+      setTimeout(function () {
+        if (RSS_PENDING[id]) { delete RSS_PENDING[id]; reject(new Error("超时：" + op)); }
+      }, 60000);
+    });
+  }
+  function rssStatus(msg) {
+    var el = document.getElementById("c96-rss-status");
+    if (el) { el.textContent = msg; }
+  }
+  function rssBtnNew(text, id, color) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = text;
+    if (id) { b.id = id; }
+    b.setAttribute("style", "height:24px;padding:0 8px;background:#1c2027;color:" + (color || "#e6e6e6") + ";border:1px solid #333a45;border-radius:5px;cursor:pointer;font:12px system-ui;");
+    return b;
+  }
+  function rssTime(ms) {
+    try { return new Date(ms).toLocaleString(); } catch (e) { return String(ms); }
+  }
+  function rssCopy(text) {
+    try {
+      var t = document.createElement("textarea");
+      t.value = text;
+      t.setAttribute("style", "position:fixed;left:-9999px;top:0;");
+      (document.body || document.documentElement).appendChild(t);
+      t.select();
+      var ok = document.execCommand("copy");
+      if (t.parentNode) { t.parentNode.removeChild(t); }
+      rssStatus(ok ? "已复制 " + text : "复制失败：" + text);
+    } catch (e) { rssStatus("复制失败：" + text); }
+  }
+  function rssUrl(base, path, sync) {
+    return "http://" + base + path + (sync ? "?t=" + sync : "");
+  }
+  function installRssPanel() {
+    if (document.getElementById("c96-rss-panel")) { return; }
+    var p = document.createElement("div");
+    p.id = "c96-rss-panel";
+    p.setAttribute("style", "display:none;position:fixed;top:54px;right:12px;width:620px;max-width:94vw;max-height:78vh;overflow:auto;z-index:2147483647;background:#14161a;color:#e6e6e6;border:1px solid #2a2e36;border-radius:10px;box-shadow:0 14px 44px rgba(0,0,0,.6);font:13px/1.55 system-ui,'Segoe UI',sans-serif;padding:12px;");
+    var head = document.createElement("div");
+    head.setAttribute("style", "display:flex;align-items:center;gap:8px;margin-bottom:8px;");
+    var title = document.createElement("b");
+    title.textContent = "RSS 内容管理器";
+    title.setAttribute("style", "color:#f59e0b;");
+    var st = document.createElement("span");
+    st.id = "c96-rss-status";
+    st.textContent = "就绪";
+    st.setAttribute("style", "flex:1;color:#9aa4b2;font-size:12px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
+    var reload = rssBtnNew("刷新", "c96-rss-reload");
+    var close = rssBtnNew("×", "c96-rss-close", "#f87171");
+    close.addEventListener("click", function () { p.style.display = "none"; });
+    reload.addEventListener("click", function () { reloadRss(); });
+    head.appendChild(title);
+    head.appendChild(st);
+    head.appendChild(reload);
+    head.appendChild(close);
+    var urls = document.createElement("div");
+    urls.id = "c96-rss-urls";
+    urls.setAttribute("style", "background:#1a1d23;border:1px solid #2a2e36;border-radius:8px;padding:8px;font-size:12px;color:#9aa4b2;");
+    urls.textContent = "订阅地址加载中…";
+    var addBox = document.createElement("div");
+    addBox.setAttribute("style", "display:flex;gap:6px;margin:8px 0;");
+    var q = document.createElement("input");
+    q.id = "c96-rss-new-q";
+    q.placeholder = "关键词：新订阅会立刻搜索并入 RAG";
+    q.setAttribute("style", "flex:1;height:28px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 8px;font:12px system-ui;");
+    var iv = document.createElement("input");
+    iv.id = "c96-rss-new-int";
+    iv.value = "300";
+    iv.title = "刷新间隔（秒）";
+    iv.setAttribute("style", "width:64px;height:28px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 6px;font:12px system-ui;");
+    var add = rssBtnNew("添加订阅", "c96-rss-add", "#93c5fd");
+    add.addEventListener("click", function () {
+      var text = (q.value || "").trim();
+      if (!text) { rssStatus("请输入关键词"); return; }
+      var secs = parseInt(iv.value, 10);
+      if (!(secs > 0)) { secs = 300; }
+      rssStatus("搜索入库中：" + text + " …");
+      ipc("topic_query", { query: text, cache_only: false, cacheOnly: false }).then(function (r) {
+        var hits = (r && r.hits) ? r.hits.length : 0;
+        return ipc("topic_update", { query: text, interval_secs: secs, intervalSecs: secs, paused: false }).then(function () {
+          rssStatus("已新增订阅「" + text + "」命中 " + hits + " 条 · 间隔 " + secs + "s");
+          q.value = "";
+          return reloadRss();
+        });
+      }).catch(function (e) { rssStatus("新增失败：" + e); });
+    });
+    addBox.appendChild(q);
+    addBox.appendChild(iv);
+    addBox.appendChild(add);
+    var tTitle = document.createElement("div");
+    tTitle.setAttribute("style", "color:#93c5fd;margin:10px 0 4px;");
+    tTitle.textContent = "关键词订阅 ";
+    var tCount = document.createElement("span");
+    tCount.id = "c96-rss-tcount";
+    tCount.setAttribute("style", "color:#9aa4b2;font-size:12px;");
+    tTitle.appendChild(tCount);
+    var tList = document.createElement("div");
+    tList.id = "c96-rss-topics";
+    tList.textContent = "加载中…";
+    var sTitle = document.createElement("div");
+    sTitle.setAttribute("style", "color:#93c5fd;margin:12px 0 4px;");
+    sTitle.textContent = "来源分组 ";
+    var sCount = document.createElement("span");
+    sCount.id = "c96-rss-scount";
+    sCount.setAttribute("style", "color:#9aa4b2;font-size:12px;");
+    sTitle.appendChild(sCount);
+    var sList = document.createElement("div");
+    sList.id = "c96-rss-sources";
+    sList.textContent = "加载中…";
+    // 全部内容：过滤 + 只看随手收录 + 逐条删
+    var dTitle = document.createElement("div");
+    dTitle.setAttribute("style", "color:#93c5fd;margin:12px 0 4px;");
+    dTitle.textContent = "全部内容 ";
+    var dCount = document.createElement("span");
+    dCount.id = "c96-rss-dcount";
+    dCount.setAttribute("style", "color:#9aa4b2;font-size:12px;");
+    dTitle.appendChild(dCount);
+    var dCtl = document.createElement("div");
+    dCtl.setAttribute("style", "display:flex;gap:6px;margin:2px 0 4px;");
+    var dq = document.createElement("input");
+    dq.id = "c96-rss-dq";
+    dq.placeholder = "过滤 标题/网址/主机/来源";
+    dq.setAttribute("style", "flex:1;height:26px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 8px;font:12px system-ui;");
+    dq.addEventListener("input", function () {
+      if (RSS_DQ_TIMER) { clearTimeout(RSS_DQ_TIMER); }
+      RSS_DQ_TIMER = setTimeout(function () { RSS_DQ_TIMER = 0; reloadDocs(); }, 250);
+    });
+    var dunsub = rssBtnNew("只看随手收录", "c96-rss-dunsub", "#fbbf24");
+    dunsub.setAttribute("data-on", "0");
+    dunsub.addEventListener("click", function () {
+      var on = this.getAttribute("data-on") === "1";
+      this.setAttribute("data-on", on ? "0" : "1");
+      this.textContent = on ? "只看随手收录" : "显示全部";
+      reloadDocs();
+    });
+    dCtl.appendChild(dq);
+    dCtl.appendChild(dunsub);
+    var dList = document.createElement("div");
+    dList.id = "c96-rss-docs";
+    dList.textContent = "加载中…";
+    // 主机制：按站点清空 / 忽略（忽略后不再自动收录）
+    var hTitle = document.createElement("div");
+    hTitle.setAttribute("style", "color:#93c5fd;margin:12px 0 4px;");
+    hTitle.textContent = "主机制 ";
+    var hCount = document.createElement("span");
+    hCount.id = "c96-rss-hcount";
+    hCount.setAttribute("style", "color:#9aa4b2;font-size:12px;");
+    hTitle.appendChild(hCount);
+    var hList = document.createElement("div");
+    hList.id = "c96-rss-hosts";
+    hList.textContent = "加载中…";
+    p.appendChild(head);
+    p.appendChild(urls);
+    p.appendChild(addBox);
+    p.appendChild(tTitle);
+    p.appendChild(tList);
+    p.appendChild(dTitle);
+    p.appendChild(dCtl);
+    p.appendChild(dList);
+    p.appendChild(hTitle);
+    p.appendChild(hList);
+    p.appendChild(sTitle);
+    p.appendChild(sList);
+    (document.body || document.documentElement).appendChild(p);
+  }
+  function rssItemLine(r) {
+    var line = document.createElement("div");
+    line.setAttribute("style", "display:flex;align-items:center;gap:6px;font-size:12px;padding:2px 0;");
+    var when = document.createElement("span");
+    when.textContent = rssTime(r[4]);
+    when.setAttribute("style", "color:#6b7280;white-space:nowrap;");
+    var a = document.createElement("a");
+    a.href = r[1];
+    a.textContent = r[2] || r[1];
+    a.title = r[1];
+    a.setAttribute("style", "flex:1;color:#93c5fd;text-decoration:none;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
+    var host = document.createElement("span");
+    host.textContent = r[3] || "";
+    host.setAttribute("style", "color:#6b7280;");
+    var del = rssBtnNew("删", null, "#f87171");
+    del.addEventListener("click", function (ev) {
+      var b = ev.currentTarget;
+      if (b.getAttribute("data-armed") !== "1") {
+        b.setAttribute("data-armed", "1");
+        b.textContent = "确认?";
+        return;
+      }
+      ipc("rss_doc_remove", { hash: r[0] }).then(function (ok) {
+        line.style.display = "none";
+        rssStatus(ok ? "已删条目 " + (r[2] || r[0]) : "条目不存在（可能已被 TTL 清掉）");
+      }).catch(function (e) { rssStatus("删条目失败：" + e); });
+    });
+    line.appendChild(when);
+    line.appendChild(a);
+    line.appendChild(host);
+    line.appendChild(del);
+    return line;
+  }
+  function renderRssItems(box, rows) {
+    box.textContent = "";
+    if (!rows || rows.length === 0) { box.textContent = "（没有条目：点「刷新」跑一次订阅搜索）"; return; }
+    for (var i = 0; i < rows.length; i++) { box.appendChild(rssItemLine(rows[i])); }
+  }
+  function rssTopicRow(t) {
+    var wrap = document.createElement("div");
+    wrap.setAttribute("style", "border:1px solid #2a2e36;border-radius:8px;padding:6px 8px;margin:5px 0;background:#1a1d23;");
+    var head = document.createElement("div");
+    head.setAttribute("style", "display:flex;align-items:center;gap:6px;");
+    var name = document.createElement("span");
+    name.textContent = "「" + t.query + "」";
+    name.setAttribute("style", "font-weight:600;flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
+    var meta = document.createElement("span");
+    meta.textContent = "间隔 " + t.interval_secs + "s · runs " + t.runs + " · 入库 " + t.stored + (t.paused ? " · 已暂停" : "");
+    meta.setAttribute("style", "color:#9aa4b2;font-size:12px;");
+    head.appendChild(name);
+    head.appendChild(meta);
+    var ops = document.createElement("div");
+    ops.setAttribute("style", "display:flex;gap:5px;flex-wrap:wrap;margin-top:5px;align-items:center;");
+    var run = rssBtnNew("刷新", null, "#93c5fd");
+    run.addEventListener("click", function () {
+      rssStatus("刷新中：" + t.query + " …");
+      ipc("topic_run", { query: t.query }).then(function (r) {
+        rssStatus("已刷新「" + t.query + "」新增 " + ((r && r.stored) ? r.stored : 0) + " 条");
+        return reloadRss();
+      }).catch(function (e) { rssStatus("刷新失败：" + e); });
+    });
+    var pause = rssBtnNew(t.paused ? "恢复" : "暂停", null, "#fbbf24");
+    pause.addEventListener("click", function () {
+      ipc("topic_update", { query: t.query, interval_secs: 0, intervalSecs: 0, paused: !t.paused }).then(function () {
+        rssStatus((t.paused ? "已恢复 " : "已暂停 ") + t.query);
+        return reloadRss();
+      }).catch(function (e) { rssStatus("操作失败：" + e); });
+    });
+    var int = document.createElement("input");
+    int.id = "c96-rss-int-" + t.key;
+    int.value = String(t.interval_secs);
+    int.title = "刷新间隔（秒）";
+    int.setAttribute("style", "width:64px;height:24px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:5px;padding:0 6px;font:12px system-ui;");
+    var save = rssBtnNew("改间隔", "c96-rss-save-" + t.key, "#86efac");
+    save.addEventListener("click", function () {
+      var v = parseInt(int.value, 10);
+      if (!(v > 0)) { rssStatus("间隔要大于 0 秒"); return; }
+      ipc("topic_update", { query: t.query, interval_secs: v, intervalSecs: v, paused: null }).then(function () {
+        rssStatus("「" + t.query + "」间隔改为 " + v + "s");
+        return reloadRss();
+      }).catch(function (e) { rssStatus("改间隔失败：" + e); });
+    });
+    var docs = rssBtnNew("条目", "c96-rss-docs-" + t.key);
+    var box = document.createElement("div");
+    box.id = "c96-rss-items-" + t.key;
+    box.setAttribute("style", "display:none;margin-top:6px;border-top:1px dashed #2a2e36;padding-top:6px;");
+    docs.addEventListener("click", function () {
+      if (box.style.display === "none") {
+        box.style.display = "block";
+        box.textContent = "加载中…";
+        ipc("topic_docs", { query: t.query, limit: 20 }).then(function (rows) { renderRssItems(box, rows); })
+          .catch(function (e) { box.textContent = "读取失败：" + e; });
+      } else { box.style.display = "none"; }
+    });
+    var del = rssBtnNew("删除", "c96-rss-del-" + t.key, "#f87171");
+    del.addEventListener("click", function (ev) {
+      var b = ev.currentTarget;
+      if (b.getAttribute("data-armed") !== "1") {
+        b.setAttribute("data-armed", "1");
+        b.textContent = "确认删除?";
+        return;
+      }
+      ipc("topic_remove", { query: t.query }).then(function (ok) {
+        rssStatus(ok ? "已删除订阅「" + t.query + "」" : "未找到订阅「" + t.query + "」");
+        return reloadRss();
+      }).catch(function (e) { rssStatus("删除失败：" + e); });
+    });
+    ops.appendChild(run);
+    ops.appendChild(pause);
+    ops.appendChild(int);
+    ops.appendChild(save);
+    ops.appendChild(docs);
+    ops.appendChild(del);
+    wrap.appendChild(head);
+    wrap.appendChild(ops);
+    wrap.appendChild(box);
+    return wrap;
+  }
+  function renderRssTopics(list) {
+    var el = document.getElementById("c96-rss-topics");
+    var cnt = document.getElementById("c96-rss-tcount");
+    if (!el) { return; }
+    el.textContent = "";
+    if (cnt) { cnt.textContent = "(" + list.length + ")"; }
+    if (list.length === 0) { el.textContent = "（还没有订阅：上面填关键词点添加）"; return; }
+    for (var i = 0; i < list.length; i++) { el.appendChild(rssTopicRow(list[i])); }
+  }
+  function renderRssSources(rows) {
+    var el = document.getElementById("c96-rss-sources");
+    var cnt = document.getElementById("c96-rss-scount");
+    if (!el) { return; }
+    el.textContent = "";
+    if (cnt) { cnt.textContent = "(" + rows.length + ")"; }
+    if (rows.length === 0) { el.textContent = "（知识库还没有内容）"; return; }
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      var line = document.createElement("div");
+      line.setAttribute("style", "display:flex;align-items:center;gap:6px;font-size:12px;padding:2px 0;");
+      var nm = document.createElement("span");
+      nm.textContent = r[0];
+      nm.setAttribute("style", "flex:1;color:#e6e6e6;");
+      var ct = document.createElement("span");
+      ct.textContent = r[1] + " 条 · " + rssTime(r[2]);
+      ct.setAttribute("style", "color:#6b7280;");
+      var cp = rssBtnNew("复制地址", null, "#93c5fd");
+      cp.addEventListener("click", function (ev) {
+        rssCopy(rssUrl(RSS_BASE[0], "/rss/source/" + encodeURIComponent(ev.currentTarget.getAttribute("data-src")) + ".xml", RSS_BASE[2]));
+      });
+      cp.setAttribute("data-src", r[0]);
+      var sclr = rssBtnNew("清空", null, "#f87171");
+      sclr.setAttribute("data-src", r[0]);
+      sclr.addEventListener("click", function (ev) {
+        var b = ev.currentTarget;
+        if (b.getAttribute("data-armed") !== "1") { b.setAttribute("data-armed", "1"); b.textContent = "确认清空?"; return; }
+        var name = b.getAttribute("data-src");
+        var raw = (name === "(none)") ? "" : name;
+        ipc("source_remove", { source: raw }).then(function (n) {
+          rssStatus("已清空来源 " + name + "：删掉 " + n + " 条");
+          return refreshLists();
+        }).catch(function (e) { rssStatus("清空来源失败：" + e); });
+      });
+      line.appendChild(nm);
+      line.appendChild(ct);
+      line.appendChild(cp);
+      line.appendChild(sclr);
+      el.appendChild(line);
+    }
+  }
+  // ---- 全部内容 / 主机制：逐条删、按站点清空、忽略该站点 ----
+  function rssFilter() {
+    var el = document.getElementById("c96-rss-dq");
+    return el ? (el.value || "") : "";
+  }
+  function rssOnlyUnsub() {
+    var el = document.getElementById("c96-rss-dunsub");
+    return !!(el && el.getAttribute("data-on") === "1");
+  }
+  function rssAnyLine(r) {
+    var line = document.createElement("div");
+    line.setAttribute("style", "display:flex;align-items:center;gap:6px;font-size:12px;padding:2px 0;");
+    var when = document.createElement("span");
+    when.textContent = rssTime(r[6]);
+    when.setAttribute("style", "color:#6b7280;white-space:nowrap;");
+    var a = document.createElement("a");
+    a.href = r[1];
+    a.textContent = r[2] || r[1];
+    a.title = r[1];
+    a.setAttribute("style", "flex:1;color:#93c5fd;text-decoration:none;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
+    var host = document.createElement("span");
+    host.textContent = r[3] || "";
+    host.setAttribute("style", "color:#6b7280;white-space:nowrap;max-width:150px;overflow:hidden;text-overflow:ellipsis;");
+    var tag = document.createElement("span");
+    if (r[5]) { tag.textContent = "#" + r[5]; tag.setAttribute("style", "color:#86efac;white-space:nowrap;"); }
+    else { tag.textContent = r[4] ? r[4] : "随手"; tag.setAttribute("style", "color:#fbbf24;white-space:nowrap;"); }
+    var del = rssBtnNew("删", null, "#f87171");
+    del.addEventListener("click", function (ev) {
+      var b = ev.currentTarget;
+      if (b.getAttribute("data-armed") !== "1") { b.setAttribute("data-armed", "1"); b.textContent = "确认?"; return; }
+      ipc("rss_doc_remove", { hash: r[0] }).then(function (ok) {
+        line.style.display = "none";
+        rssStatus(ok ? "已删 " + (r[2] || r[0]) : "条目不存在（可能已被 TTL 清掉）");
+        if (ok) { return refreshLists(); }
+      }).catch(function (e) { rssStatus("删条目失败：" + e); });
+    });
+    line.appendChild(when);
+    line.appendChild(a);
+    line.appendChild(host);
+    line.appendChild(tag);
+    line.appendChild(del);
+    return line;
+  }
+  function renderRssDocs(o) {
+    var el = document.getElementById("c96-rss-docs");
+    var cnt = document.getElementById("c96-rss-dcount");
+    if (!el) { return; }
+    var rows = (o && o.rows) ? o.rows : [];
+    var total = (o && o.total !== undefined) ? o.total : 0;
+    el.textContent = "";
+    var mode = rssOnlyUnsub() ? " · 只看随手" : "";
+    if (cnt) { cnt.textContent = "(库中 " + total + " 条 · 显示 " + rows.length + " 条" + mode + ")"; }
+    if (rows.length === 0) { el.textContent = "（没有匹配内容：换个过滤词，或点「显示全部」）"; return; }
+    for (var i = 0; i < rows.length; i++) { el.appendChild(rssAnyLine(rows[i])); }
+  }
+  function reloadDocs() {
+    var el = document.getElementById("c96-rss-docs");
+    if (!el) { return Promise.resolve(); }
+    el.textContent = "加载中…";
+    return ipc("docs", { filter: rssFilter(), only_unsub: rssOnlyUnsub(), limit: 300 })
+      .then(function (o) { renderRssDocs(o); })
+      .catch(function (e) { el.textContent = "读取失败：" + e; });
+  }
+  function rssHostRow(r) {
+    var raw = (r[0] === "(none)") ? "" : r[0];
+    var line = document.createElement("div");
+    line.setAttribute("style", "display:flex;align-items:center;gap:6px;font-size:12px;padding:2px 0;");
+    var nm = document.createElement("span");
+    nm.textContent = r[0];
+    nm.setAttribute("style", "flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:" + (r[4] ? "#6b7280" : "#e6e6e6") + ";" + (r[4] ? "text-decoration:line-through;" : ""));
+    var ct = document.createElement("span");
+    ct.textContent = r[1] + " 条 · " + rssTime(r[2]);
+    ct.setAttribute("style", "color:#6b7280;white-space:nowrap;");
+    line.appendChild(nm);
+    line.appendChild(ct);
+    if (raw) {
+      var clr = rssBtnNew("清空", null, "#f87171");
+      clr.addEventListener("click", function (ev) {
+        var b = ev.currentTarget;
+        if (b.getAttribute("data-armed") !== "1") { b.setAttribute("data-armed", "1"); b.textContent = "确认清空?"; return; }
+        ipc("host_remove", { host: raw }).then(function (n) {
+          rssStatus("已清空 " + raw + "：删掉 " + n + " 条");
+          return refreshLists();
+        }).catch(function (e) { rssStatus("清空失败：" + e); });
+      });
+      var ig = rssBtnNew(r[4] ? "取消忽略" : "忽略", null, r[4] ? "#86efac" : "#fbbf24");
+      ig.addEventListener("click", function () {
+        ipc("ignore", { host: raw, on: !r[4] }).then(function () {
+          rssStatus((r[4] ? "已取消忽略 " : "已忽略 ") + raw + (r[4] ? "" : "（以后不再自动收录）"));
+          return refreshLists();
+        }).catch(function (e) { rssStatus("忽略失败：" + e); });
+      });
+      line.appendChild(clr);
+      line.appendChild(ig);
+    }
+    return line;
+  }
+  function renderRssHosts(rows) {
+    var el = document.getElementById("c96-rss-hosts");
+    var cnt = document.getElementById("c96-rss-hcount");
+    if (!el) { return; }
+    el.textContent = "";
+    if (cnt) { cnt.textContent = "(" + rows.length + ")"; }
+    if (!rows || rows.length === 0) { el.textContent = "（知识库还没有内容）"; return; }
+    for (var i = 0; i < rows.length; i++) { el.appendChild(rssHostRow(rows[i])); }
+  }
+  function reloadHosts() {
+    return ipc("hosts").then(function (rows) { renderRssHosts(rows || []); }).catch(function () {});
+  }
+  function reloadSources() {
+    return ipc("rss_sources").then(function (rows) { renderRssSources(rows || []); }).catch(function () {});
+  }
+  // 删/清空/忽略后只刷列表（不动关键词订阅，避免把已展开的条目收起来）
+  function refreshLists() {
+    return Promise.all([reloadSources(), reloadHosts(), reloadDocs()]).then(function () {});
+  }
+  function renderRssUrls() {
+    var el = document.getElementById("c96-rss-urls");
+    if (!el) { return; }
+    el.textContent = "";
+    var local = RSS_BASE[0];
+    var lan = RSS_BASE[1];
+    var sync = RSS_BASE[2];
+    if (!local) { el.textContent = "RSS 服务未启动（GUI 启动时会自动开）"; return; }
+    var rows = [
+      ["本机", rssUrl(local, "/rss/all.xml", sync), "全部内容"],
+      ["本机", rssUrl(local, "/opml.xml", sync), "OPML 一键导入"]
+    ];
+    if (lan && lan !== local) {
+      rows.push(["局域网", rssUrl(lan, "/rss/all.xml", sync), "手机/其他设备"]);
+      rows.push(["局域网", rssUrl(lan, "/opml.xml", sync), "OPML"]);
+    }
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      var line = document.createElement("div");
+      line.setAttribute("style", "display:flex;align-items:center;gap:6px;padding:1px 0;");
+      var tag = document.createElement("span");
+      tag.textContent = row[0];
+      tag.setAttribute("style", "color:#f59e0b;white-space:nowrap;");
+      var u = document.createElement("span");
+      u.textContent = row[1];
+      u.setAttribute("style", "flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:#e6e6e6;");
+      var note = document.createElement("span");
+      note.textContent = row[2];
+      note.setAttribute("style", "color:#6b7280;white-space:nowrap;");
+      var cp = rssBtnNew("复制", null, "#93c5fd");
+      cp.setAttribute("data-url", row[1]);
+      cp.addEventListener("click", function (ev) { rssCopy(ev.currentTarget.getAttribute("data-url")); });
+      line.appendChild(tag);
+      line.appendChild(u);
+      line.appendChild(note);
+      line.appendChild(cp);
+      el.appendChild(line);
+    }
+  }
+  function reloadRss() {
+    rssStatus("加载中…");
+    return ipc("rss_base").then(function (b) {
+      RSS_BASE = b || ["", "", ""];
+      renderRssUrls();
+      return Promise.all([
+        ipc("topic_list").catch(function (e) { return { err: String(e) }; }),
+        ipc("rss_sources").catch(function () { return []; }),
+        ipc("hosts").catch(function () { return []; }),
+        ipc("docs", { filter: rssFilter(), only_unsub: rssOnlyUnsub(), limit: 300 }).catch(function (e) { return { err: String(e) }; })
+      ]);
+    }).then(function (res) {
+      var ts = (res[0] && res[0].length !== undefined) ? res[0] : [];
+      renderRssTopics(ts);
+      renderRssSources(res[1] || []);
+      renderRssHosts(res[2] || []);
+      renderRssDocs(res[3] || {});
+      var bad = (res[0] && res[0].err) ? " · IPC 错误: " + res[0].err : "";
+      var shown = (res[3] && res[3].shown !== undefined) ? res[3].shown : 0;
+      rssStatus("订阅 " + ts.length + " 个 · 来源 " + ((res[1] || []).length) + " 个 · 主机 " + ((res[2] || []).length) + " 个 · 内容 " + shown + " 条" + bad);
+    }).catch(function (e) { rssStatus("加载失败：" + e); });
+  }
+  function toggleRssPanel() {
+    installRssPanel();
+    var p = document.getElementById("c96-rss-panel");
+    if (!p) { return; }
+    if (!p.style.display || p.style.display === "none") {
+      p.style.display = "block";
+      reloadRss();
+    } else {
+      p.style.display = "none";
+    }
+  }
+  window.__C96_RSS_UI__ = {
+    open: function () {
+      installRssPanel();
+      var p = document.getElementById("c96-rss-panel");
+      if (p) { p.style.display = "block"; }
+      return reloadRss();
+    },
+    close: function () {
+      var p = document.getElementById("c96-rss-panel");
+      if (p) { p.style.display = "none"; }
+    },
+    reload: function () { return reloadRss(); },
+    reloadDocs: function () { return reloadDocs(); },
+    reloadHosts: function () { return reloadHosts(); },
+    reloadSources: function () { return reloadSources(); },
+    status: function (m) { rssStatus(m); },
+    reply: rssReply,
+    post: post
+  };
+  function boot() {
+    installBar();
+    setTimeout(capture, 1800);
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else {
+    boot();
+  }
+  post("ready", document.title);
+})();"##;
+
+
+/// 打开（或复用）自控窗口并导航到 url。
+pub fn open(app: &AppHandle, url: &str) -> Result<String, String> {
+    let parsed = tauri::Url::parse(url).map_err(|e| format!("invalid url: {}", e))?;
+    if let Some(win) = app.get_webview_window("browser") {
+        let quoted = serde_json::to_string(url).map_err(|e| e.to_string())?;
+        let js = "window.location.href = ".to_string() + &quoted + ";";
+        win.eval(&js).map_err(|e| e.to_string())?;
+        return Ok("reused browser window -> ".to_string() + url);
+    }
+    let nav_app = app.clone();
+    let load_app = app.clone();
+    let win = WebviewWindowBuilder::new(app, "browser", WebviewUrl::External(parsed))
+        .title("C96 自控窗口 — WebView2")
+        .inner_size(1100.0, 800.0)
+        .initialization_script(LINKS_INIT)
+        .initialization_script(SNAPSHOT_INIT)
+        .initialization_script(EVENTS_INIT)
+        .on_navigation(move |u| {
+            let url = u.to_string();
+            println!("[c96 browser] navigate -> {}", url);
+            record(&nav_app, "navigation", &url, "");
+            true
+        })
+        .on_page_load(move |_win, payload| {
+            let url = payload.url().to_string();
+            let kind = match payload.event() {
+                tauri::webview::PageLoadEvent::Started => "load-start",
+                tauri::webview::PageLoadEvent::Finished => "load-finish",
+            };
+            record(&load_app, kind, &url, "");
+        })
+        .build()
+        .map_err(|e| e.to_string())?;
+    let current = win.url().map(|u| u.to_string()).unwrap_or_default();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let status = match install_web_message(app, "browser") {
+        Ok(s) => s,
+        Err(e) => "install failed: ".to_string() + &e,
+    };
+    return Ok("opened browser window -> ".to_string() + &current + " | " + &status);
+}
+/// E3：主窗口 = 浏览器（外部 URL）+ C96 叠加搜索条 + 自动 RAG 采集。
+pub fn open_main(app: &AppHandle, start_url: &str) -> Result<String, String> {
+    let parsed = tauri::Url::parse(start_url).map_err(|e| format!("invalid url: {}", e))?;
+    let nav_app = app.clone();
+    let load_app = app.clone();
+    let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(parsed))
+        .title("C96 — 浏览器 / RAG 采集")
+        .inner_size(1280.0, 860.0)
+        .initialization_script(LINKS_INIT)
+        .initialization_script(SNAPSHOT_INIT)
+        .initialization_script(OVERLAY_INIT)
+        .on_navigation(move |u| {
+            let url = u.to_string();
+            record(&nav_app, "navigation", &url, "");
+            true
+        })
+        .on_page_load(move |_win, payload| {
+            let url = payload.url().to_string();
+            let kind = match payload.event() {
+                tauri::webview::PageLoadEvent::Started => "load-start",
+                tauri::webview::PageLoadEvent::Finished => "load-finish",
+            };
+            record(&load_app, kind, &url, "");
+        })
+        .build()
+        .map_err(|e| e.to_string())?;
+    let current = win.url().map(|u| u.to_string()).unwrap_or_default();
+    return Ok("opened main browser -> ".to_string() + &current);
+}
+
+
+/// E1 探针：报告自控窗口是否已开、当前 URL、注入的钩子名。
+pub fn probe(app: &AppHandle) -> Result<String, String> {
+    match app.get_webview_window("browser") {
+        Some(win) => {
+            let url = win.url().map(|u| u.to_string()).unwrap_or_default();
+            let mut s = "browser window: OPEN".to_string();
+            s.push(char::from(10));
+            s.push_str("current url  : ");
+            s.push_str(&url);
+            s.push(char::from(10));
+            s.push_str("snapshot hook: window.__C96_SNAPSHOT__.capture()");
+            s.push(char::from(10));
+            s.push_str("event hook   : window.__C96_EVENTS__ (click/spa -> postMessage)");
+            return Ok(s);
+        }
+        None => { return Ok("browser window: CLOSED (click 打开自控窗口)".to_string()); }
+    }
+}
+
+/// 把闭包放到 webview 主线程执行并取回字符串结果。
+/// with_webview 的闭包必须 Send + 'static，所以用 channel 回传。
+fn run_on_webview<F>(win: &WebviewWindow, f: F) -> Result<String, String>
+where
+    F: FnOnce(&tauri::webview::PlatformWebview) -> String + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    win.with_webview(move |pw| {
+        let _ = tx.send(f(&pw));
+    })
+    .map_err(|e| e.to_string())?;
+    return rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| format!("with_webview timeout: {}", e));
+}
+
+/// 直接读底层 WebView2 状态（webview2-rs 路径）。
+pub fn raw_info(app: &AppHandle, label: &str) -> Result<String, String> {
+    let win = app
+        .get_webview_window(label)
+        .ok_or_else(|| format!("no webview window {:?}", label))?;
+    return run_on_webview(&win, |pw| raw::info(pw));
+}
+
+/// 直接改 WebView2 缩放（webview2-rs 路径）。
+pub fn raw_zoom(app: &AppHandle, label: &str, factor: f64) -> Result<String, String> {
+    let win = app
+        .get_webview_window(label)
+        .ok_or_else(|| format!("no webview window {:?}", label))?;
+    return run_on_webview(&win, move |pw| raw::zoom(pw, factor));
+}
+
+/// 直接用 ICoreWebView2::Navigate 导航（webview2-rs 路径）。
+pub fn raw_navigate(app: &AppHandle, label: &str, url: &str) -> Result<String, String> {
+    let win = app
+        .get_webview_window(label)
+        .ok_or_else(|| format!("no webview window {:?}", label))?;
+    let url = url.to_string();
+    return run_on_webview(&win, move |pw| raw::navigate(pw, &url));
+}
+
+/// E2：安装 AddWebMessageReceived（webview2-rs 路径）。
+pub fn install_web_message(app: &AppHandle, label: &str) -> Result<String, String> {
+    let win = app
+        .get_webview_window(label)
+        .ok_or_else(|| format!("no webview window {:?}", label))?;
+    let app2 = app.clone();
+    return run_on_webview(&win, move |pw| install_dispatch(pw, app2));
+}
+
+#[cfg(windows)]
+fn install_dispatch(pw: &tauri::webview::PlatformWebview, app: AppHandle) -> String {
+    return raw_events::install(pw, app);
+}
+
+#[cfg(not(windows))]
+fn install_dispatch(_pw: &tauri::webview::PlatformWebview, _app: AppHandle) -> String {
+    return "web message: Windows only".to_string();
+}
+
+/// 裸 WebView2 控制：Windows 走 webview2-com，其他平台返回说明字符串。
+/// cfg 只放在 item 上（Rust 稳定版不允许把 cfg 属性放在块表达式上）。
+mod raw {
+    use tauri::webview::PlatformWebview;
+
+    #[cfg(windows)]
+    pub fn info(pw: &PlatformWebview) -> String {
+        return info_win(pw);
+    }
+
+    #[cfg(not(windows))]
+    pub fn info(_pw: &PlatformWebview) -> String {
+        return "raw WebView2: only available on Windows".to_string();
+    }
+
+    #[cfg(windows)]
+    pub fn zoom(pw: &PlatformWebview, factor: f64) -> String {
+        return zoom_win(pw, factor);
+    }
+
+    #[cfg(not(windows))]
+    pub fn zoom(_pw: &PlatformWebview, _factor: f64) -> String {
+        return "raw WebView2: only available on Windows".to_string();
+    }
+
+    #[cfg(windows)]
+    pub fn navigate(pw: &PlatformWebview, url: &str) -> String {
+        return navigate_win(pw, url);
+    }
+
+    #[cfg(not(windows))]
+    pub fn navigate(_pw: &PlatformWebview, _url: &str) -> String {
+        return "raw WebView2: only available on Windows".to_string();
+    }
+
+    #[cfg(windows)]
+    fn read_pwstr(p: windows::core::PWSTR) -> String {
+        // WebView2 用 CoTaskMemAlloc 分配这些字符串，读完必须释放。
+        let s = unsafe { p.to_string().unwrap_or_default() };
+        unsafe {
+            windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const core::ffi::c_void));
+        }
+        return s;
+    }
+
+    #[cfg(windows)]
+    fn info_win(pw: &PlatformWebview) -> String {
+        use windows::core::BOOL;
+        use windows::core::PWSTR;
+        let mut lines: Vec<String> = Vec::new();
+        let controller = pw.controller();
+        lines.push("PlatformWebview::controller() -> ICoreWebView2Controller  [webview2-com]".to_string());
+        unsafe {
+            match controller.CoreWebView2() {
+                Ok(core) => {
+                    lines.push("controller.CoreWebView2() -> ICoreWebView2".to_string());
+                    let mut src = PWSTR::null();
+                    if core.Source(&mut src).is_ok() {
+                        lines.push("Source()        = ".to_string() + &read_pwstr(src));
+                    }
+                    let mut title = PWSTR::null();
+                    if core.DocumentTitle(&mut title).is_ok() {
+                        lines.push("DocumentTitle() = ".to_string() + &read_pwstr(title));
+                    }
+                    if let Ok(s) = core.Settings() {
+                        let mut b = BOOL(0);
+                        if s.IsScriptEnabled(&mut b).is_ok() {
+                            lines.push(format!("Settings.IsScriptEnabled     = {}", b.as_bool()));
+                        }
+                        let mut b2 = BOOL(0);
+                        if s.IsWebMessageEnabled(&mut b2).is_ok() {
+                            lines.push(format!("Settings.IsWebMessageEnabled = {}", b2.as_bool()));
+                        }
+                        let mut b3 = BOOL(0);
+                        if s.AreDevToolsEnabled(&mut b3).is_ok() {
+                            lines.push(format!("Settings.AreDevToolsEnabled  = {}", b3.as_bool()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    lines.push("controller.CoreWebView2() failed: ".to_string() + &e.message().to_string());
+                }
+            }
+            let mut rect = windows::Win32::Foundation::RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            if controller.Bounds(&mut rect).is_ok() {
+                lines.push(format!(
+                    "controller.Bounds = ({}, {})  {} x {}",
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top
+                ));
+            }
+        }
+        let mut s = String::new();
+        for (i, l) in lines.iter().enumerate() {
+            if i > 0 {
+                s.push(char::from(10));
+            }
+            s.push_str(l);
+        }
+        return s;
+    }
+
+    #[cfg(windows)]
+    fn zoom_win(pw: &PlatformWebview, factor: f64) -> String {
+        let controller = pw.controller();
+        let r = unsafe { controller.SetZoomFactor(factor) };
+        return match r {
+            Ok(()) => format!("SetZoomFactor({}) ok", factor),
+            Err(e) => "SetZoomFactor failed: ".to_string() + &e.message().to_string(),
+        };
+    }
+
+    #[cfg(windows)]
+    fn navigate_win(pw: &PlatformWebview, url: &str) -> String {
+        let controller = pw.controller();
+        let core = match unsafe { controller.CoreWebView2() } {
+            Ok(c) => c,
+            Err(e) => {
+                return "CoreWebView2() failed: ".to_string() + &e.message().to_string();
+            }
+        };
+        let target = windows::core::HSTRING::from(url);
+        let r = unsafe { core.Navigate(&target) };
+        return match r {
+            Ok(()) => "ICoreWebView2::Navigate -> ".to_string() + url,
+            Err(e) => "Navigate failed: ".to_string() + &e.message().to_string(),
+        };
+    }
+}
+
+/// E2：webview2-com 的 AddWebMessageReceived 回调。
+#[cfg(windows)]
+mod raw_events {
+    use std::sync::OnceLock;
+
+    use tauri::webview::PlatformWebview;
+    use tauri::AppHandle;
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2WebMessageReceivedEventArgs;
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2WebMessageReceivedEventHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2WebMessageReceivedEventHandler_Impl;
+    use windows::core::implement;
+    use windows::core::Ref;
+    use windows::core::PWSTR;
+
+    static APP: OnceLock<AppHandle> = OnceLock::new();
+
+    #[implement(ICoreWebView2WebMessageReceivedEventHandler)]
+    struct WebMsgHandler;
+
+    fn read_and_free(p: PWSTR) -> String {
+        let s = unsafe { p.to_string().unwrap_or_default() };
+        unsafe {
+            windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const core::ffi::c_void));
+        }
+        return s;
+    }
+
+    impl ICoreWebView2WebMessageReceivedEventHandler_Impl for WebMsgHandler_Impl {
+        fn Invoke(
+            &self,
+            _sender: Ref<'_, ICoreWebView2>,
+            args: Ref<'_, ICoreWebView2WebMessageReceivedEventArgs>,
+        ) -> windows::core::Result<()> {
+            let args = args.ok()?;
+            let mut text = String::new();
+            unsafe {
+                let mut p = PWSTR::null();
+                if args.TryGetWebMessageAsString(&mut p).is_ok() {
+                    text = read_and_free(p);
+                }
+                if text.is_empty() {
+                    let mut q = PWSTR::null();
+                    if args.WebMessageAsJson(&mut q).is_ok() {
+                        text = read_and_free(q);
+                    }
+                }
+            }
+            if !text.is_empty() {
+                if let Some(app) = APP.get() {
+                    super::ingest(app, &text);
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    pub fn install(pw: &PlatformWebview, app: AppHandle) -> String {
+        let _ = APP.set(app);
+        unsafe {
+            let core = match pw.controller().CoreWebView2() {
+                Ok(c) => c,
+                Err(e) => {
+                    return "CoreWebView2 failed: ".to_string() + &e.message().to_string();
+                }
+            };
+            let handler: ICoreWebView2WebMessageReceivedEventHandler = WebMsgHandler.into();
+            return match core.add_WebMessageReceived(&handler, std::ptr::null_mut()) {
+                Ok(()) => "add_WebMessageReceived installed".to_string(),
+                Err(e) => "add_WebMessageReceived failed: ".to_string() + &e.message().to_string(),
+            };
+        }
+    }
+}
