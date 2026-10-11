@@ -1,129 +1,138 @@
 # C96 — 资讯聚合 → RSS-like 订阅 → 完整索引 → 本地 AI 知识库
 
-## 阶段 C1 — 轻量抓取层：HTTP client ✅ 2026-10-07
+> 给一个关键词，C96 就持续把网上最新内容搜回来、去重入库，并立刻变成一份**自己的 RSS / OPML 订阅源**（阅读器、手机直接添加）；这份本地库同时也是可检索的知识底座。
+> Rust 核心（`src/`）+ Tauri v2 / WebView2 GUI（`gui/`）；HTML 抽取、BM25 索引、JSONL 存储、指纹去重都是自写，核心依赖只有 5 个 crate（serde / serde_json / toml / ureq / xml-rs）。
 
-**模块**：`src/fetch/`（`http.rs` + `cache.rs`）· **依赖**：`ureq 2.12.1`（rustls + ring 纯 Rust TLS；Cargo.lock 81 pkgs，一次联网后离线编译）
+## 功能
 
-### 功能
-- **UA**：默认 `C96/0.1.0 rss-aggregator` + `Accept: application/rss+xml, atom, xml;q=0.9, html;q=0.7, */*;q=0.5` + `Accept-Language: zh-CN,zh;q=0.9,en;q=0.8`（可 override）
-- **timeout**：overall 20s（`--timeout`）· connect 6s（`--connect`）· read 20s
-- **retry**：默认 2 次额外尝试；exponential backoff 400ms→800→1600…cap 8s；`Retry-After`（整数秒，cap 30s）优先；**只 retry 传输类错误 + 429/503**；确定性错误（InvalidUrl / UnknownScheme / TooManyRedirects / Proxy*）fail fast（1 attempt）；`or_any_status()` 让 4xx/5xx 落 Reply（报告、不 retry）
-- **ETag/Last-Modified 缓存**：conditional GET（`If-None-Match` / `If-Modified-Since`）→ 304 = 复用 cached body（0 bytes re-fetched）；2xx 全替换 validators（stale ETag 绝不存活于 200）；304 回显的 validators 采纳、body 永远取 cached；fetch 失败保留旧 entry
-- **缓存文件**：`cache/http_cache.toml`（TOML `[[entry]]`：url / etag / last_modified / content_type / status / body；atomic `path.tmp`→rename；cap 100 newest；broken/missing = empty cache，never fatal）
-- **body cap**：1 MiB（`--max-body`），UTF-8 lossy 解码（GBK SERP 属阶段 D）
-- **重定向**：redirects=5，`final_url` 报告（`redirected →`）
+### 关键词订阅（核心）
+- **没搜过** → 立刻 Bing / Baidu 搜索 → 相关性排序 → 抓前 N 页正文（HTML 抽取 / RSS 条目 / 纯文本，带 ETag 条件 GET）→ 写库，**同时建立常驻任务**
+- **搜过** → 直接读本地库返回（1–11 ms，不联网、`runs` 不增加）
+- **数据旧了** → 先返回旧数据，再后台补搜一次；程序只要在运行，就按 `interval_secs`（默认 30 min）到期自动刷新
+- 同一关键词的后台刷新只跑一个（inflight 去重）；任务可刷新 / 暂停 / 恢复 / 删除
 
-### CLI
+### 本地 RSS 服务器（启动即用）
+- GUI 一启动就监听 `127.0.0.1:8787`；`C96_RSS_BIND=0.0.0.0:8787` 可开放局域网
+- **默认不需要 token**，地址直接给阅读器 / 手机；要限制访问才 `--token X` 或 `C96_RSS_TOKEN`
+- 新入库文档 = 新 `<item>`（`guid` = 内容 hash，`pubDate` = 入库时间）→ 阅读器轮询即见推送
+- 一键脚本 `start-rss-lan.ps1`（或双击 `start-rss-lan.bat`）：识别局域网 IP → 起 GUI → 等端口就绪 → 打印全部订阅地址；`-Headless` 只跑服务、`-Stop` 停服务、`-OpenIndex` 打开发现页
+
+### RAG 知识库
+- 单一 JSONL（默认 `%APPDATA%\com.c96.gui\kb.jsonl`），**GUI 与 CLI 共用同一个文件**
+- 入库三道指纹去重：URL hash → 标题 shingle → 正文 simhash（≥400 字才判近重复；re-fetch 不产生重复记录）
+- **30 天 TTL**：超期记录在打开 / purge 时自动丢弃并原子重写
+- 手动增删查：`store add|list|search|purge|state`；GUI 面板可逐条删、按站点清空
+
+### 检索（BM25）
+- `C96 index query --query Q`：词项 = 字符码点整数（中文按字），标题 ×3 / 正文 ×1 + 整串短语加成
+- 惰性建索引 + 进程内缓存；10k 文档 **0.42 ms/查询**，100k **2.1 ms/查询**
+
+### 浏览器自控 + 反爬
+- Tauri v2 + WebView2 浏览器窗口（默认停在 Bing），顶部叠加 C96 工具栏：关键词 / 网址框、链接修正（`target=_blank` / `window.open` 都留在当前窗口）
+- 页面加载后自动把正文送进 RAG；工具栏搜索框的输入会成为后续入库条目的 `query` 标注
+- 点击 / 跳转 / 搜索词都会作为浏览器事件记录下来（`browser_event`）
+
+### RSS 内容管理器（GUI 顶部 RSS 图标）
+- **查**：订阅列表（间隔 / runs / 入库数）+ 展开最近条目 + 来源分组
+- **增**：填关键词 + 间隔 → 立刻搜一轮并建任务
+- **改**：立即刷新 / 暂停恢复 / 行内改间隔
+- **删**：订阅删除、单条内容删除、**按站点清空**，全部二次确认
+- **全部内容**：列出库里所有条目（含随便浏览自动收录的那批），可按 标题 / 网址 / 主机 / 来源 过滤；「只看随手收录」只留不属于任何现存订阅的
+- **忽略**：把某个站点加入忽略名单，之后不再自动收录（存在 `state.toml` 的 `[meta] ignored_hosts`）
+
+## 快速开始
+
+### 1. 构建
+```powershell
+cargo build --release                 # 核心 CLI → target/release/C96.exe
+cargo test --offline                  # 103/103（lib 85 + bin 18）
+cd gui ; cargo build --release        # GUI → gui/target/release/c96-gui.exe
 ```
-cargo run -- fetch --url URL [--timeout N] [--connect N] [--retries N] [--max-body N]
-                     [--cache PATH] [--no-cache] [--show-body]
+
+### 2. GUI（双击即用）
+把 `C96.exe` 与 `c96-gui.exe` 放同一目录，或保持 `gui/target/{release,debug}/` 布局；双击 `C96.exe`（无参数）就会拉起 GUI。也可以 `C96 gui`；找不到 GUI 时打印用法提示，`C96_GUI` 环境变量可显式指定路径。
+
+### 3. 局域网 RSS
+```powershell
+.\start-rss-lan.ps1                    # 默认 8787、无 token，打印本机 + 局域网订阅地址
+.\start-rss-lan.ps1 -Port 8899 -OpenIndex
+.\start-rss-lan.ps1 -Token mysecret    # 需要限制访问时
+.\start-rss-lan.ps1 -Headless -Kb D:\kb.jsonl -Tail
+.\start-rss-lan.ps1 -Stop              # 停掉占用该端口的进程
 ```
-输出：status / attempts / final_url / content-type / etag / last-modified / bytes / cache 状态
 
-### 验证（2026-10-07，本机实测）
-- `cargo build` **0 warning**（clean rebuild 11.65s）· `cargo test` **35/35 green**（C1 新增 19 tests）
-- live 200→304：`example.com`（Last-Modified only）· `raw.githubusercontent.com/rust-lang/rust/master/README.md`（weak ETag `W/"…"`）· `www.rust-lang.org`（ETag+LM，redirect→rust-lang.org）
-- live 无验证器：Bing News RSS（209 KB，redirect→cn.bing.com）→ 每次 plain GET 200（缓存仍存 body，供 C2 解析）
-- retry 分类：`c96-nonexistent-domain.invalid` → Dns，3 attempts 后 exit 1 · `not a url` → InvalidUrl，1 attempt
-- 截断：`--max-body 100` → `body: 100 bytes` + `truncated at --max-body cap 100`
-- 网络抖动实录：raw 条件 GET 一次 `Io`（read timeout）→ retry 分类正确，复跑 304
+### 4. CLI 常用
+```powershell
+C96 research --query "卡普空 最新游戏"           # 没搜过就立刻搜 + 入库 + 建任务
+C96 research --query "rust 编译器" --cache-only  # 只读 RAG，不联网
+C96 research --query "rust 编译器" --watch       # 常驻，按 --interval 到期刷新
+C96 topics list|show|run|pause|resume|rm|due     # 任务清单（持久化）
+C96 rss serve --bind 0.0.0.0:8787                # 无 GUI 的常驻 RSS 服务
+C96 search --query "RAG 本地知识库" --store       # SERP 候选 + 顺手入库
+C96 index query --query "卡普空" --json
+C96 fetch --url https://example.com --store       # 单次抓取（ETag 缓存）+ 入库
+```
 
-### 有意推迟
-- robots.txt / per-domain 限速 → 阶段 D/E（反爬层，与浏览器自控配套）
-- HTTP-date 形式 `Retry-After` → 阶段 F（日历层）
-- GBK/GB2312 SERP 解码 → 阶段 D
+## 订阅端点
 
-### 下一步
-阶段 E3 已完成（默认双击 = 浏览器主窗口 + 搜索 + 自动入 RAG；CLI → GUI 启动桥）→ 下一步 **阶段 F 存储层** / embedding 检索
+| 地址 | 内容 |
+|---|---|
+| `/` | HTML 发现页（列出全部订阅地址） |
+| `/rss/all.xml` | 全部入库内容 |
+| `/rss/t/<slug>.xml` | 单个关键词订阅 |
+| `/rss/topic.xml?q=关键词` | 同上，按词查询 |
+| `/rss/source/<name>.xml` | 单个来源（`category` = source） |
+| `/opml.xml` | OPML，阅读器一键导入全部订阅 |
+| `/health` | 健康检查（返回 `ok`） |
 
-## 阶段 C2 — RSS 2.0 + Atom 解析 ✅ 2026-10-07
+开 token 时地址自动带 `?t=…`（也接受 `?token=…`）。端口以 `C96_RSS_BIND` / `--bind` 为准（默认 `127.0.0.1:8787`）。
 
-**模块**：`src/fetch/feed.rs` · **依赖**：`xml-rs 0.8.29`（离线已缓存）
+## 数据与配置
 
-- `parse_feed` 由 root 自动分派：`<rss>` → `parse_rss`，`<feed>` → `parse_atom`
-- 统一 `Article{title,url,body,published,site,lang}`：`content:encoded`(CDATA) 优先 `description`、实体解码、Atom `<link rel=alternate>` 排序、`<published>` 优先 `<updated>`、`site` 取 host、`lang` 取 feed 语言
-- CLI：`feed parse --file PATH [--limit N]`（UTF-8 BOM 剥离）
-- 验证：`tests/fixtures/rss.xml`(6)/`atom.xml`(5) 全部结构化正确
+| 东西 | 位置 / 开关 |
+|---|---|
+| 知识库 | `%APPDATA%\com.c96.gui\kb.jsonl`（`--kb PATH` 覆盖） |
+| 抓取状态 / 订阅任务 / 忽略名单 | 同目录 `kb.state.toml`（`[[fetch]]` / `[[topic]]` / `[meta] ignored_hosts`） |
+| HTTP 缓存（ETag / Last-Modified） | `cache/http_cache.toml` |
+| 用户偏好 + `[[feeds]]` | `config/feeds.toml`（当前目录没有就找 exe 同级） |
+| RSS 监听地址 | `C96_RSS_BIND`（默认 `127.0.0.1:8787`） |
+| RSS token（可选） | `C96_RSS_TOKEN` / `rss serve --token X` / 启动脚本 `-Token` |
+| GUI 可执行文件路径 | `C96_GUI` |
 
-## 阶段 C3 — HTML 正文抽取（link/text density）✅ 2026-10-07
+TTL 默认 30 天，`--ttl-days N` 覆盖。数据都在 `%APPDATA%` 下，换目录安装不影响已有知识库。
 
-**模块**：`src/fetch/html.rs` + `src/cli/html.rs` · 零新依赖
+## 阶段进度
 
-- **DOM-lite 容错 parser**：arena 节点（0=`#root`），void 元素、`<script>/<style>/<noscript>/<template>/<svg>/<iframe>` 内容整段丢弃，注释/doctype/PI 跳过；数字 + named entities 解码；畸形 HTML 不 panic
-- **子树统计**：每个元素累计 text 字数 / 元素数 / `<a>` 链接字数（child 索引 > parent → 反向一次自底向上）
-- **评分选块**：容器级标签候选，`score = text_density(text/(tags+1)) × (1 − link_density)² × classWeight`；nav/footer/sidebar/comment/ads 祖先直接排除；article/content/post… 加权
-- **渲染**：块级标签插换行 → 逐行 collapse/trim → 去空行；boilerplate 子树跳过
-- `extract()` → title/text_len/link_density/selector；`article_from_html()` → C2 `Article`（含 `<html lang>`）
-- CLI：`html extract --file PATH [--url URL] [--max-chars N] [--meta]`
-- 验证：`tests/fixtures/article.html` → 选中 `<article class="post-content">`，368 chars，link-density 0.000，script+style+nav+sidebar+comments+footer 全剔除
+- [x] **A** 骨架：目录布局 + 编译验证
+- [x] **B** 配置层：`config/feeds.toml`、`feeds list|add`、TOML 1.1 解析 + 校验报错
+- [x] **C1** HTTP 抓取：UA / 超时 / 重试分类 / ETag 条件 GET + 磁盘缓存
+- [x] **C2** RSS 2.0 + Atom 解析
+- [x] **C3** HTML 正文抽取（text / link density 评分）
+- [x] **D** 搜索引擎驱动：Bing（News RSS + SERP）、Baidu SERP、查询计划、URL 归一化
+- [x] **E** 浏览器自控：WebView2 骨架 → 点击跳转事件 → 自动入 RAG → CLI→GUI 启动桥 → `target=_blank` 链接修复
+- [x] **F** 存储层：JSONL + 原子重写、三道指纹去重、30 天 TTL、`state.toml`
+- [x] **G** 索引层：自写倒排 + BM25（标题 ×3 / 正文 ×1 + 短语加成）
+- [x] **I1 / I2 / I3** 关键词订阅任务 + 定时刷新 + 本地 RSS 服务器（GUI 与 CLI 共用一套存储）
+- [ ] **H** AI 层：embedding、向量检索、`ask` 问答（当前检索止步于 BM25）
+- [ ] **I1b** `[[feeds]]` 订阅并入同一调度器
+- [ ] **I4** HTTP `/search` `/ask` 端点
+- [ ] **J** 集成测试 / 基准 / 文档收尾（`cargo fmt` 待跑）
 
-## 阶段 D — 搜索引擎驱动层（Bing / Baidu SERP）✅ 2026-10-07
+## 已知限制
+- Baidu 对非浏览器请求常回「百度安全验证」，走浏览器自控窗口可绕过，但拿到的正文是 AJAX 终态（存整页 innerText，质量取决于 C3）
+- 中文分词只做字符级近似，没有词典 / 词干；没有时间衰减权重，所以新内容不会排更前
+- 无 embedding 与向量检索，`ask` 未实现；`[[feeds]]` 目前只支持解析 / 列表 / 新增（`feeds list|add`），还没接进抓取与调度
 
-**模块**：`src/search/{query,bing,baidu,normalize}.rs` + `src/cli/search.rs` · 零新依赖
+## 测试
+```powershell
+cargo test --offline                          # 103/103（lib 85 + bin 18）
+cd gui
+.\target\debug\c96-gui.exe --selftest-rag     # 自动入库 + 指纹去重 + TTL
+.\target\debug\c96-gui.exe --selftest-topics  # 关键词订阅（首搜 / 命中 / 后台刷新）
+.\target\debug\c96-gui.exe --selftest-links   # target=_blank / window.open 点击
+.\target\debug\c96-gui.exe --selftest-rss-ui  # RSS 内容管理器（增删改查 + 忽略站点）
+```
 
-- **D1 `query.rs`**：`build_plan(keywords, site, engine)` / `plan_from_feed(&Feed)` → query 文本（含 `site:HOST`）；`bing_rss_url` / `bing_serp_url` / `baidu_serp_url`；手写 percent + base64/base64url
-- **D2 `bing.rs`**：News RSS（复用 C2）→ 候选；SERP `<li class="b_algo">`（h2>a / b_caption / 嵌套去重）；`/ck/a?u=a1<base64url>` 解码
-- **D3 `baidu.rs`**：SERP `<div class="result|c-container">`；真实 URL：`mu` → `data-url` → `data-tools` JSON → `link?url=` 的 `ClickUrl/url/target/from`（percent/base64url）；解不开标 `resolved=false`；`cookie()` 生成 BAIDUID
-- **D4 `normalize.rs`**：URL normalize（fragment/跟踪参数/host 小写/默认端口/尾 `/`）、FNV-1a 64 hash、glob 白黑名单、hash 去重（resolved 优先）
-- CLI：`search [--query Q | --feed NAME] [--engine bing|baidu|auto] [--site HOST] [--max N] [--from FILE] [--cookie] [--timeout] [--retries]`
-- 验证：live `search --query "rust 编译器"` → Bing 10 + Baidu 27 → 37 unique；`--feed bing-serp-zh` → 8 unique（blacklist 过滤 2）；`--from tests/fixtures/baidu_serp.html` → 4/4
+## License
 
-### live 现状（2026-10-07）
-- Bing News `format=rss` 端点已退化为返回首页 HTML → RSS driver 保留（fixture/单元验证），live 落到 Bing SERP
-- Baidu 对非浏览器请求返回「百度安全验证」页 → Baidu 真实抓取需阶段 E（webview2-rs 快照 / BAIDUID 会话）
-
-### 尚未做
-- robots.txt / per-domain 限速（阶段 D/E 反爬层）
-- GBK/GB2312 SERP 解码（`ie=utf-8` 已规避）
-## 阶段 E1 — Tauri v2 GUI 骨架 + WebView2 自控窗口 ✅ 2026-10-07
-
-**模块**：独立 crate `gui/`（**不进入根 C96 的零依赖核心构建**）· 依赖：`tauri 2.12` / `tauri-build 2.7` + Windows `webview2-com 0.39` / `windows 0.62`
-
-- **外壳**：`gui/tauri.conf.json`（`withGlobalTauri` + 静态 `ui/` 前端 → 不需要 npm/bundler）；`gui/capabilities/default.json`；`gui/tools/make_icon.mjs` 零依赖生成 `icons/icon.ico`（满足 tauri-build 的 Windows 资源要求）
-- **自控窗口** `gui/src/browser.rs`：label=`browser` 的第二个 WebView2 窗口；`initialization_script` 注入快照钩子 `window.__C96_SNAPSHOT__.capture()`（E3 入口）；`on_navigation` 记录用户点击/跳转
-- **webview2-rs 裸控制**：`Webview::with_webview` → `PlatformWebview::controller()` → `ICoreWebView2Controller` / `ICoreWebView2`，读 `Source()` / `DocumentTitle()` / `Settings()` / `Bounds()`，执行 `SetZoomFactor` / `Navigate`
-- **命令**：`open_browser` / `snapshot_probe` / `webview2_info` / `webview2_zoom` / `webview2_navigate`；`--selftest` 无人值守验收
-- **验证**：gui `cargo build` **0 warning** · `c96-gui.exe --selftest` 原生 **exit 0**（`DocumentTitle()=C96_HOOK_OK` 证明注入成功；`Source()` example.com → rust-lang.org；zoom 1.5 ok）· 截图 [e1-window.png](gui/docs/e1-window.png) · 根 CLI 回归 **62/62 green**
-
-### 构建 / 运行
-- `cd gui; cargo run`（或直接双击 `c96-gui.exe`，**无参数**）— 打开**浏览器主窗口**：Bing 起始页 + 顶部 C96 搜索/网址条；页面加载后自动存入 RAG 知识库
-- `cd gui; cargo run -- --selftest` — 无人值守 E1+E2 自检（裸 WebView2 + 事件，约 10s，exit 0）
-- `cd gui; cargo run -- --selftest-rag` — 无人值守 E3 自检（自动入库 + 去重 + 搜索链路，约 30s，exit 0）
-- RAG 知识库落盘：`%APPDATA%\com.c96.gui\kb.jsonl`（JSONL + URL 去重；命令 `kb_stats` / `kb_search`）
-- `cd gui; cargo build --release` → 双击 **`gui/target/release/c96-gui.exe`**（Windows GUI 子系统，**无控制台闪窗**）
-- ⚠️ 别混淆：`C96/target/debug/C96.exe` 是**核心 CLI**（无参数会打印 usage 后立即退出 → 双击「一闪而过」）；GUI 可执行文件叫 `c96-gui.exe`
-- 🚩 **两个 crate 的产物不同**：根 `cargo build [--release]` 只生成核心 CLI `C96/target/release/C96.exe`；GUI 是独立 crate，**必须 `cd gui` 再构建**才会得到 `gui/target/release/c96-gui.exe`
-- **双击入口**：项目根 [C96 GUI.lnk](RUST/C96/C96%20GUI.lnk)（指向 `gui/target/release/c96-gui.exe`，可拖到桌面）——双击即开浏览器主窗口，无控制台黑窗
-- GUI 与核心分离：根 `cargo build` / `cargo test` 不会拉入 Tauri 依赖树
-## 阶段 E2 — 用户点击/跳转事件监听 ✅ 2026-10-07
-
-**模块**：`gui/src/browser.rs`（事件层）+ `gui/ui/app.js`（实时事件流）· 依赖新增 `windows-core 0.62`（`#[implement]` 生成代码需要）
-
-- **注入钩子** `EVENTS_INIT`（`initialization_script`，逐文档生效）：capture 阶段 `click`（最近 `<a>` 的 tag|href|text）、`hashchange` / `popstate`、`location.href` 轮询（SPA）
-- **回传通道**：`window.chrome.webview.postMessage`（WebView2 原生，不依赖 Tauri IPC 的远端 origin 策略）
-- **接收**：裸 `ICoreWebView2::add_WebMessageReceived` + `#[implement] ICoreWebView2WebMessageReceivedEventHandler`；`TryGetWebMessageAsString` → `WebMessageAsJson` 兜底，`CoTaskMemFree` 释放
-- **记录 / 广播**：`BrowserEvent{seq,kind,url,detail,at_ms}` 环形日志（cap 500）+ `emit("browser://event")`
-- **导航**：`on_navigation`（含重定向）与 `on_page_load`（`load-start` / `load-finish`）
-- **命令**：`browser_events` / `browser_events_clear` / `browser_event`（IPC 兜底）
-- **验证**：`--selftest` exit 0 —— 合成点击 `click=1`；裸 `Navigate` 后 `nav=3 load=4 ready=1`
-
-## 阶段 E3 — 默认双击 = 浏览器主窗口 + 搜索 + 自动入 RAG ✅ 2026-10-08
-
-**E4/E5 已按用户要求删除**（idle 自动快照、CDP/Edge 兜底不再作为独立任务）。
-
-**模块**：`gui/src/browser.rs`（`OVERLAY_INIT` + `open_main`）、`gui/src/store.rs`（RAG 知识库）、`gui/src/main.rs`（默认启动 + `boot_main`）
-
-- **默认启动**：`tauri.conf.json` 的 `windows` 置空；`setup()` 用 `WebviewWindowBuilder` 建 `main` 窗口（`about:blank` → 装好 `add_WebMessageReceived` → `Navigate` 到 `https://www.bing.com/`）。**主窗口本身就是浏览器**，双击无需任何参数
-- **页面内搜索条**：`OVERLAY_INIT` 在每页顶部叠加 C96 搜索/网址输入框；回车 → `{type:"search"}`（记为当前 query）→ `http(s)://` 直开、否则 Bing SERP；同时保留 click / SPA / `ready` 事件
-- **自动入库**：`DOMContentLoaded` 后 1.8s 读 `document.body.innerText`（临时隐藏叠加条）→ `{type:"capture",url,title,text}` → `store.rs` 追加写
-- **RAG 知识库** `gui/src/store.rs`：`%APPDATA%\com.c96.gui\kb.jsonl`，每行 `KbDoc{hash,url,title,text,query,host,stored_at_ms,text_len}`；`FNV-1a64(normalized URL)` 去重 + `text_len<200` 跳过；`kb_stats` / `kb_search`（子串匹配计分 + 片段）。embedding/向量索引留待后续
-- **验证**：gui `cargo build` **0 warning** · 真实无参数双击 15s → kb `2→3`（`cn.bing.com` 搜索页 875 字）· `--selftest-rag` exit 0：`+1` 文档、`search("Rust")` `score=27`、重复 URL `skip: duplicate url`、模拟输入「c96 端到端检索」→ SERP 入库 `query=c96 端到端检索`（3245 字）· 截图 [e3-main-window.png](gui/docs/e3-main-window.png)
-
-## 阶段 E3+ — CLI → GUI 启动桥 ✅ 2026-10-08
-
-**模块**：`src/cli/gui.rs`（零新依赖：std + 一个 `ShellExecuteW` FFI 声明）
-
-- **无参数（双击）** 运行 `C96.exe` → 查找并拉起 GUI 进程（不再打印 usage）；`C96 gui` 显式启动；GUI 未构建则回退打印 usage 并给出构建提示
-- **候选路径**：同目录 `c96-gui.exe` → `<root>/gui/target/release/c96-gui.exe` → `<root>/gui/target/debug/...` → 当前工作目录下同理；环境变量 `C96_GUI` 可显式指定
-- **不继承句柄**：Windows 用 `ShellExecuteW`（shell32）交由 shell 启动。用 `std::process::Command` 时 Windows 创建进程 `inherit_handles=TRUE`，GUI 子进程会持有父进程 stdout 管道，导致 `C96 gui` 带管道调用一直挂住（已实测并修掉）
-- **验证**：core build（debug+release）**0 warning** · `cargo test --offline` **65/65 green**（+3 个 gui 路径单测）· release `C96 --help` 打印 usage 且**不**启动 GUI · 无参数 **46ms** 返回并拉起 GUI（标题 `C96 — 浏览器 / RAG 采集`）· `help` / `-h` / `--version` 同样不再误启 GUI
+MIT — 见 [LICENSE](LICENSE)。
