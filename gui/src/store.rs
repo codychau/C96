@@ -59,6 +59,13 @@ pub fn save(app: &AppHandle, url: &str, title: &str, text: &str, query: &str, mi
     return with(app, |s| s.save(url, title, text, query, "gui-browser", min_len))?;
 }
 
+/// E7：GUI 浏览器自动入库（带正文抽取模式）。重访同一 URL 时，如果本次抽取比旧记录干净
+/// （模式升级，或正文明显变长），Store 会用新正文替换旧记录 —— 历史上「整页 raw（含菜单）」
+/// 的条目因此能被一次干净重访自动修好，而不是被 URL 去重永远挡住。
+pub fn save_capture(app: &AppHandle, url: &str, title: &str, text: &str, query: &str, min_len: usize, mode: &str) -> Result<String, String> {
+    return with(app, |s| s.save_refresh(url, title, text, query, "gui-browser", min_len, mode))?;
+}
+
 pub fn stats(app: &AppHandle) -> Result<KbStats, String> {
     return with(app, |s| s.stats());
 }

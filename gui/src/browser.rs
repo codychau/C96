@@ -113,9 +113,18 @@ pub fn ingest(app: &AppHandle, raw: &str) {
     if kind == "capture" {
         let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("");
         let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+        let mode = v.get("mode").and_then(|x| x.as_str()).unwrap_or("raw");
+        let sel = v.get("selector").and_then(|x| x.as_str()).unwrap_or("");
+        let lr = v.get("link_ratio").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let chars = text.chars().count();
+        // E7 闸门：整块都是链接的页面（导航页 / 搜索结果页 / 列表页）不进知识库
+        if lr >= 0.7 && chars < 3000 {
+            record(app, "store-skip", url, &format!("skip: link-ratio {:.0}% ({} 字, {} {})", lr * 100.0, chars, mode, sel));
+            return;
+        }
         let q = current_query();
-        match crate::store::save(app, url, title, text, &q, 200) {
-            Ok(msg) => record(app, "store", url, &msg),
+        match crate::store::save_capture(app, url, title, text, &q, 200, mode) {
+            Ok(msg) => record(app, "store", url, &format!("{} · {} 链接{:.0}%{}", msg, mode, lr * 100.0, if sel.is_empty() { String::new() } else { format!(" · {}", sel) })),
             Err(e) => record(app, "store-error", url, &e),
         }
         return;
@@ -179,6 +188,216 @@ pub const SNAPSHOT_INIT: &str = r##"(function () {
   window.__C96_SNAPSHOT__ = api;
 })();"##;
 
+/// E7：正文抽取（readability-lite，跑在活的 DOM 上）。
+/// 与 Rust 侧 C3（src/fetch/html.rs，HTTP 抓取路径）同一思路：
+///   score = 密度 × (1-链接密度)² × 权重；候选 = 语义容器 ∪ 段落聚类。
+/// 区别在于这里直接读渲染后的 DOM（JS 站点的正文此时才存在），并且：
+///   1) 打分与渲染都跳过 菜单/侧栏/推荐/广告/评论/页脚（含中文类名）
+///   2) 渲染时丢掉「整块都是链接」的小块（导航项 / 标签云 / 相关阅读）
+///   3) 全页都是链接时返回 mode=fallback，由 Rust 侧链接密度闸门决定不收录
+pub const EXTRACT_INIT: &str = r##"(function () {
+  if (window.__C96_EXTRACT__) { return; }
+  var NEG = ["nav","menu","footer","sidebar","side-bar","comment","share","social","related","recomm",
+    "advert","promo","breadcrumb","pagination","pager","copyright","subscribe","newsletter","login",
+    "signup","cookie","banner","widget","toolbar","sponsor","searchbar","search-bar","topbar","top-bar",
+    "nav-bar","tags","tag-list","hot-list","rank-list","qrcode","float","popup","modal","mask",
+    "推荐","相关","广告","评论","登录","注册","下载","扫码","更多","热榜","排行","标签","导航","侧栏","页脚","猜你","推广"];
+  var POS = ["article","content","post","entry","story","main","body","text","detail","read",
+    "markdown","prose","正文","文章","news"];
+  var SKIPTAGS = {SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,SVG:1,IFRAME:1,CANVAS:1,FORM:1,BUTTON:1,
+    SELECT:1,OPTION:1,TEXTAREA:1,INPUT:1,NAV:1,HEADER:1,FOOTER:1,ASIDE:1,DIALOG:1,MENU:1,LINK:1,META:1};
+  var BLOCKS = {P:1,DIV:1,SECTION:1,ARTICLE:1,MAIN:1,H1:1,H2:1,H3:1,H4:1,H5:1,H6:1,UL:1,OL:1,LI:1,
+    BLOCKQUOTE:1,PRE:1,FIGURE:1,FIGCAPTION:1,DL:1,DT:1,DD:1,TD:1,TH:1,TR:1,TABLE:1,CAPTION:1,ADDRESS:1};
+  var SEM = ["article","main","[role=main]","[itemprop~=articleBody]","[itemprop~=articlebody]",
+    "#article-content","#articleContent","#js_content","#content","#main-content","#mainContent",
+    "#detail",".article-content",".articleContent",".article-body",".articleBody",".post-content",
+    ".postContent",".entry-content",".entryContent",".content-body",".contentBody",".artical-content",
+    ".art_content",".rich_media_content",".RMContent",".news-content",".detail-content",".article",".post",".entry"];
+  function nws(s) {
+    var n = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c !== 32 && c !== 9 && c !== 10 && c !== 13) { n++; }
+    }
+    return n;
+  }
+  function label(el) {
+    var c = "";
+    try { c = el.className || ""; } catch (e) { c = ""; }
+    if (typeof c !== "string") { c = (el.getAttribute ? el.getAttribute("class") : "") || ""; }
+    return (c + " " + (el.id || "")).toLowerCase();
+  }
+  function hit(el, list) {
+    var s = label(el);
+    if (!s) { return false; }
+    for (var i = 0; i < list.length; i++) { if (s.indexOf(list[i]) >= 0) { return true; } }
+    return false;
+  }
+  function skipEl(el) {
+    if (!el || !el.tagName) { return false; }
+    if (SKIPTAGS[el.tagName]) { return true; }
+    if (el.getAttribute && el.getAttribute("aria-hidden") === "true") { return true; }
+    return hit(el, NEG);
+  }
+  function insideSkip(el, stop) {
+    var cur = el;
+    while (cur && cur !== stop) {
+      if (skipEl(cur)) { return true; }
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+  function metrics(el) {
+    var m = { tags: 0, link: 0, skipTxt: 0, text: 0 };
+    m.text = nws(el.textContent || "");
+    var kids = el.querySelectorAll ? el.querySelectorAll("*") : [];
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      m.tags++;
+      if (skipEl(k)) { m.skipTxt += nws(k.textContent || ""); continue; }
+      if (k.tagName === "A") { m.link += nws(k.textContent || ""); }
+    }
+    m.clean = m.text - Math.min(m.skipTxt, m.text);
+    if (m.clean < 0) { m.clean = 0; }
+    return m;
+  }
+  function scoreOf(el, plen) {
+    var m = metrics(el);
+    var base = Math.max(plen || 0, m.clean * 0.55);
+    if (base < 120) { return null; }
+    var ld = m.link / Math.max(m.text, 1);
+    if (ld > 0.7) { return null; }
+    var density = base / (m.tags + 1);
+    var w = 1.0;
+    if (hit(el, POS)) { w = w * 1.4; }
+    var t = el.tagName;
+    if (t === "ARTICLE" || t === "MAIN") { w = w * 1.15; }
+    var ip = el.getAttribute ? (el.getAttribute("itemprop") || "").toLowerCase() : "";
+    if (ip.indexOf("articlebody") >= 0) { w = w * 1.2; }
+    if (t === "BODY" || t === "UL" || t === "OL" || t === "TABLE") { w = w * 0.8; }
+    return { score: density * (1 - ld) * (1 - ld) * w, clean: m.clean, ld: ld, base: base, tags: m.tags };
+  }
+  function selectorOf(el) {
+    var s = el.tagName.toLowerCase();
+    if (el.id) { s = s + "#" + el.id; }
+    var c = "";
+    try { c = el.className || ""; } catch (e) { c = ""; }
+    if (typeof c === "string" && c) { s = s + "." + c.replace(/^ +| +$/g, "").split(/ +/)[0]; }
+    return s.slice(0, 60);
+  }
+  function linkRatioOf(el) {
+    var m = metrics(el);
+    return m.link / Math.max(m.text, 1);
+  }
+  function isLinkBox(k) {
+    var t = k.tagName;
+    if (t !== "UL" && t !== "OL" && t !== "DIV" && t !== "LI" && t !== "SECTION" && t !== "P") { return false; }
+    var txt = nws(k.textContent || "");
+    if (txt <= 0 || txt > 200) { return false; }
+    var as = k.querySelectorAll ? k.querySelectorAll("a") : [];
+    if (!as.length) { return false; }
+    var lt = 0;
+    for (var i = 0; i < as.length; i++) { lt += nws(as[i].textContent || ""); }
+    return lt / txt >= 0.8;
+  }
+  function render(el, out) {
+    if (!el) { return; }
+    if (el.nodeType === 3) { out.text += el.nodeValue; return; }
+    if (el.nodeType !== 1) { return; }
+    if (el !== out.root && skipEl(el)) { return; }
+    var block = !!BLOCKS[el.tagName];
+    var t = out.text;
+    if (block && t && t.charAt(t.length - 1) !== "\n") { out.text += "\n"; }
+    var kids = el.childNodes;
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (k.nodeType === 1 && isLinkBox(k)) { continue; }
+      render(k, out);
+    }
+    t = out.text;
+    if (block && t && t.charAt(t.length - 1) !== "\n") { out.text += "\n"; }
+    return;
+  }
+  function normalize(raw) {
+    var lines = raw.split("\n");
+    var out = [];
+    var last = "";
+    for (var i = 0; i < lines.length; i++) {
+      var l = lines[i].replace(/[\t \u00a0\u3000]+/g, " ").replace(/^ +| +$/g, "");
+      if (!l || l.length < 2) { continue; }
+      if (l === last) { continue; }
+      out.push(l);
+      last = l;
+    }
+    return out.join("\n");
+  }
+  function extract() {
+    var t0 = (new Date()).getTime();
+    var body = document.body;
+    if (!body) { return { text: "", chars: 0, linkRatio: 0, selector: "body?", mode: "empty", candidates: 0, ms: 0 }; }
+    var plen = (typeof Map === "function") ? new Map() : null;
+    var ps = body.getElementsByTagName("p");
+    var pn = Math.min(ps.length, 1500);
+    for (var i = 0; i < pn; i++) {
+      var p = ps[i];
+      var len = nws(p.textContent || "");
+      if (len < 12) { continue; }
+      if (insideSkip(p, body)) { continue; }
+      var cur = p.parentElement;
+      var depth = 0;
+      while (cur && depth < 12) {
+        if (plen) { plen.set(cur, (plen.get(cur) || 0) + len); }
+        cur = cur.parentElement;
+        depth++;
+      }
+    }
+    var seen = [];
+    var cands = [];
+    function add(el) {
+      if (!el || !el.tagName) { return; }
+      if (seen.indexOf(el) >= 0) { return; }
+      seen.push(el);
+      cands.push(el);
+    }
+    for (var s = 0; s < SEM.length; s++) {
+      var els = null;
+      try { els = document.querySelectorAll(SEM[s]); } catch (e) { els = null; }
+      if (!els) { continue; }
+      for (var j = 0; j < els.length && j < 4; j++) { add(els[j]); }
+    }
+    if (plen) { plen.forEach(function (v, el) { if (v >= 120) { add(el); } }); }
+    add(body);
+    var best = body;
+    var bestScore = -1;
+    var bestPlen = 0;
+    var bestClean = 0;
+    for (var c = 0; c < cands.length; c++) {
+      var el = cands[c];
+      if (el !== body && insideSkip(el, null)) { continue; }
+      var pl = plen ? (plen.get(el) || 0) : 0;
+      var sc = scoreOf(el, pl);
+      if (!sc) { continue; }
+      if (sc.score > bestScore) { bestScore = sc.score; best = el; bestPlen = pl; bestClean = sc.clean; }
+    }
+    var mode = "fallback";
+    if (bestScore >= 0) {
+      mode = (bestPlen >= 120) ? "cluster" : "semantic";
+      if (best.tagName === "ARTICLE") { mode = "article"; }
+    }
+    // 正文分散在多个 section 时单个候选会明显偏小：整页去掉导航后仍以正文为主（链接少）就退一级用 body
+    if (best !== body) {
+      var bm = metrics(body);
+      var bld = bm.link / Math.max(bm.text, 1);
+      if (bm.clean > bestClean * 3 && bld < 0.4) { best = body; mode = "fallback"; }
+    }
+    var out = { text: "", root: best };
+    render(best, out);
+    var text = normalize(out.text);
+    return { text: text, chars: nws(text), linkRatio: linkRatioOf(best), selector: selectorOf(best),
+      mode: mode, candidates: cands.length, ms: ((new Date()).getTime() - t0) };
+  }
+  window.__C96_EXTRACT__ = { version: 1, extract: extract, nws: nws, skipEl: skipEl };
+})();"##;
 /// E2：事件钩子。点击 / SPA / ready 通过 WebView2 原生 postMessage 回传。
 pub const EVENTS_INIT: &str = r##"(function () {
   if (window.__C96_EVENTS__) { return; }
@@ -323,16 +542,56 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     } catch (e) {}
     input.focus();
   }
+  // E7：自动入库的正文抽取 —— 不再用整页 innerText（会把菜单/侧栏/推荐一起摘进来）。
+  // 抽取交给 __C96_EXTRACT__（EXTRACT_INIT）；读不到时退化回 innerText（mode=raw）。
+  function extractPage() {
+    var ex = window.__C96_EXTRACT__;
+    if (ex && ex.extract) {
+      try { return ex.extract(); } catch (e) {}
+    }
+    var t = "";
+    try { t = document.body ? document.body.innerText : ""; } catch (e) {}
+    return { text: t, chars: t.length, linkRatio: 0, selector: "", mode: "raw" };
+  }
+  var CAP = { url: "", seq: 0, last: -1, tries: 0, stable: 0, fired: false };
   function capture() {
     var bar = document.getElementById("c96-bar");
     var status = document.getElementById("c96-status");
     if (bar) { bar.style.display = "none"; }
-    var text = "";
-    try { text = document.body ? document.body.innerText : ""; } catch (e) {}
+    var r = extractPage();
+    var text = r.text || "";
     var title = document.title || "";
     if (bar) { bar.style.display = "flex"; }
-    post("capture", "", { title: title, text: text });
-    if (status) { status.textContent = "已送存 " + String(text.length) + " 字"; }
+    if (status) {
+      var tag = r.mode + (r.selector ? " " + r.selector : "") + (r.linkRatio ? " · 链接 " + Math.round(r.linkRatio * 100) + "%" : "");
+      status.textContent = "已送存 " + String(text.length) + " 字（" + tag + "）";
+    }
+    post("capture", "", { title: title, text: text, mode: r.mode, selector: r.selector, link_ratio: r.linkRatio, chars: r.chars });
+  }
+  // 抢在正文渲染出来之前抓会把菜单存进去：等到「文本长度稳定」再送存，最多等 8 次。
+  function tick(seq) {
+    if (seq !== CAP.seq || CAP.fired) { return; }
+    CAP.tries = CAP.tries + 1;
+    var r = extractPage();
+    var n = (typeof r.chars === "number" && r.chars >= 0) ? r.chars : (r.text || "").length;
+    var tol = Math.max(30, Math.round(n * 0.02));
+    if (n >= 400 && Math.abs(n - CAP.last) <= tol) { CAP.stable = CAP.stable + 1; } else { CAP.stable = 0; }
+    CAP.last = n;
+    if ((n >= 400 && CAP.stable >= 1) || CAP.tries >= 6) { CAP.fired = true; capture(); return; }
+    setTimeout(function () { tick(seq); }, CAP.tries < 3 ? 800 : 1400);
+  }
+  function beginCapture() {
+    CAP.url = location.href;
+    CAP.seq = CAP.seq + 1;
+    CAP.last = -1;
+    CAP.tries = 0;
+    CAP.stable = 0;
+    CAP.fired = false;
+    var seq = CAP.seq;
+    setTimeout(function () { tick(seq); }, 1000);
+  }
+  function watchNav() {
+    if (location.href !== CAP.url) { beginCapture(); }
   }
   function describe(el) {
     if (!el || !el.tagName) { return ""; }
@@ -920,7 +1179,8 @@ pub const OVERLAY_INIT: &str = r##"(function () {
   };
   function boot() {
     installBar();
-    setTimeout(capture, 1800);
+    beginCapture();
+    setInterval(watchNav, 1500);
   }
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot);
@@ -947,6 +1207,7 @@ pub fn open(app: &AppHandle, url: &str) -> Result<String, String> {
         .inner_size(1100.0, 800.0)
         .initialization_script(LINKS_INIT)
         .initialization_script(SNAPSHOT_INIT)
+        .initialization_script(EXTRACT_INIT)
         .initialization_script(EVENTS_INIT)
         .on_navigation(move |u| {
             let url = u.to_string();
@@ -982,6 +1243,7 @@ pub fn open_main(app: &AppHandle, start_url: &str) -> Result<String, String> {
         .inner_size(1280.0, 860.0)
         .initialization_script(LINKS_INIT)
         .initialization_script(SNAPSHOT_INIT)
+        .initialization_script(EXTRACT_INIT)
         .initialization_script(OVERLAY_INIT)
         .on_navigation(move |u| {
             let url = u.to_string();

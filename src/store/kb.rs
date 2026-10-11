@@ -90,6 +90,16 @@ pub fn default_state_path(kb: &Path) -> PathBuf {
     return kb.with_file_name(stem + ".state.toml");
 }
 
+/// E7 抽取模式排序：raw/空（整页 innerText）< fallback（退化为去导航的整页）< cluster/semantic/article（真正的正文块）。
+/// `save_refresh` 用它判断「这次重捕是不是比旧记录更干净」。
+pub fn mode_rank(mode: &str) -> u8 {
+    return match mode {
+        "cluster" | "semantic" | "article" => 2,
+        "fallback" => 1,
+        _ => 0,
+    };
+}
+
 pub fn make_snippet(text: &str, q: &str, width: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     let lower = text.to_lowercase();
@@ -191,6 +201,11 @@ impl Store {
 
     /// F2 去重 + F1 追加入库。返回人类可读结果（stored: ... / skip: ...）。
     pub fn save(&mut self, url: &str, title: &str, text: &str, query: &str, source: &str, min_len: usize) -> Result<String, String> {
+        return self.save_with_mode(url, title, text, query, source, min_len, "");
+    }
+
+    /// 同 save，但记录抽取模式（E7：GUI 自动入库用 mode 判断旧条目是不是整页 raw）。
+    pub fn save_with_mode(&mut self, url: &str, title: &str, text: &str, query: &str, source: &str, min_len: usize, mode: &str) -> Result<String, String> {
         if text.trim().is_empty() { return Ok("skip: empty text".to_string()); }
         let chars = text.chars().count();
         if chars < min_len { return Ok(format!("skip: text_len {} < {}", chars, min_len)); }
@@ -231,6 +246,7 @@ impl Store {
             text_len: chars,
             shingle: sh,
             simhash: sim,
+            mode: mode.to_string(),
         };
         let line = serde_json::to_string(&doc).map_err(|e| e.to_string())?;
         jsonl::append_line(&self.path, &line)?;
@@ -238,6 +254,48 @@ impl Store {
         self.index(doc);
         self.idx = None;
         return Ok(msg);
+    }
+
+    /// E7：GUI 浏览器重访同一 URL 时，先按普通路径入库；若撞上 `skip: duplicate url`，
+    /// 且本次抽取比旧记录干净（模式升级，或正文明显变长），就用新正文替换旧记录。
+    /// 这样历史上「整页 innerText（含菜单/推荐）」的条目会被一次干净重访自动修好。
+    pub fn save_refresh(&mut self, url: &str, title: &str, text: &str, query: &str, source: &str, min_len: usize, mode: &str) -> Result<String, String> {
+        let msg = self.save_with_mode(url, title, text, query, source, min_len, mode)?;
+        if !msg.starts_with("skip: duplicate url") { return Ok(msg); }
+        let chars = text.chars().count();
+        if chars < min_len { return Ok(msg); }
+        let hash = url_key(url);
+        let idx = match self.docs.iter().position(|d| d.hash == hash) {
+            Some(i) => i,
+            None => return Ok(msg),
+        };
+        let old = self.docs[idx].clone();
+        let old_rank = mode_rank(&old.mode);
+        let new_rank = mode_rank(mode);
+        let longer = chars >= old.text_len + 200 && chars * 10 >= old.text_len * 12;
+        // 模式升级：cluster/semantic/article 是真正文容器，字数更少也换；fallback 是整页退级，必须字数不亏太多
+        let upgrade = new_rank > old_rank && (new_rank >= 2 || chars * 2 >= old.text_len);
+        if !upgrade && !longer {
+            return Ok(format!("{} · 保留旧记录（{}->{} 字 / 模式 {}->{}）", msg, old.text_len, chars,
+                if old.mode.is_empty() { "raw" } else { old.mode.as_str() },
+                if mode.is_empty() { "raw" } else { mode }));
+        }
+        let mut d = old.clone();
+        d.title = title.to_string();
+        d.text = text.to_string();
+        d.query = query.to_string();
+        d.text_len = chars;
+        d.shingle = title_shingle(title);
+        d.simhash = simhash(text);
+        d.mode = mode.to_string();
+        d.stored_at_ms = now_ms();
+        self.docs[idx] = d;
+        self.rewrite_docs(&self.docs)?;
+        self.rebuild();
+        self.idx = None;
+        return Ok(format!("replaced: {} ({} -> {} chars, mode {} -> {})", hash, old.text_len, chars,
+            if old.mode.is_empty() { "raw" } else { old.mode.as_str() },
+            if mode.is_empty() { "raw" } else { mode }));
     }
 
     /// TTL 演示 / 测试：入库后把时间回拨 days_back 天（需要整文件重写）。
@@ -640,5 +698,37 @@ mod tests {
         let back = Store::open(&p, 30).unwrap();
         assert_eq!(back.state().ignored_hosts.len(), 0);
         assert_eq!(back.stats().docs, 1);
+    }
+    #[test]
+    fn recapture_replaces_raw_doc_with_cleaner_extract() {
+        let p = kb("f_kb_refresh.jsonl");
+        let mut s = Store::open(&p, DEFAULT_TTL_DAYS).unwrap();
+        let url = "https://recapture.example.com/a";
+        // 旧记录：整页 innerText（模式 raw），又长又脏（菜单 + 推荐全在里面）
+        let dirty = "新闻 体育 汽车 房产 旅游 教育 时尚 科技 登录 注册 广告 推荐 ".to_string() + &"正文内容 ".repeat(80);
+        let a = s.save_with_mode(url, "标题", &dirty, "", "gui-browser", 10, "raw").unwrap();
+        assert!(a.starts_with("stored:"), "{}", a);
+        assert_eq!(s.stats().docs, 1);
+        // 重访：抽取器给出干净正文（模式 cluster），虽然更短也必须替换
+        let clean = "这是抽取后的干净正文段落。".repeat(20);
+        let b = s.save_refresh(url, "标题", &clean, "查询词", "gui-browser", 10, "cluster").unwrap();
+        assert!(b.starts_with("replaced:"), "{}", b);
+        assert_eq!(s.stats().docs, 1, "替换不应新增记录");
+        let last = s.last().unwrap();
+        assert!(!last.text.contains("体育"), "菜单不该留在新正文里");
+        assert_eq!(last.mode, "cluster");
+        assert_eq!(last.query, "查询词");
+        // 同样模式、字数没变多 -> 保持旧记录（不白写盘）
+        let c = s.save_refresh(url, "标题", &clean, "查询词", "gui-browser", 10, "cluster").unwrap();
+        assert!(c.starts_with("skip: duplicate url"), "{}", c);
+        // 低模式（fallback 整页退级）且字数大幅缩水 -> 不能把好记录换坏，保留旧记录
+        let short = "退级后很短的一段话。".repeat(3);
+        let d = s.save_refresh(url, "标题", &short, "查询词", "gui-browser", 10, "fallback").unwrap();
+        assert!(d.starts_with("skip: duplicate url"), "{}", d);
+        assert_eq!(s.last().unwrap().mode, "cluster", "不该被 fallback 短文本覆盖");
+        // 落盘后再打开：替换结果持久化，去重表已重建（同标题不同 URL 仍会被标题 shingle 拦住）
+        let back = Store::open(&p, DEFAULT_TTL_DAYS).unwrap();
+        assert_eq!(back.stats().docs, 1);
+        assert_eq!(back.last().unwrap().mode, "cluster");
     }
 }

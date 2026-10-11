@@ -5,7 +5,8 @@
 //! 每次页面加载后把正文自动写入本地 RAG 知识库（store.rs，JSONL + URL 去重）。
 //!
 //! 附带：--selftest（E1/E2 裸 WebView2 + 事件）、--selftest-rag（E3 自动入库）、
-//!      --selftest-topics（I 主题订阅）、--selftest-links（链接点击：target=_blank / window.open）。
+//!      --selftest-topics（I 主题订阅）、--selftest-links（链接点击：target=_blank / window.open）、
+//!      --selftest-extract（E7 正文抽取：菜单/侧栏/推荐不进门，链接堆页被闸门拦住）。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -306,7 +307,8 @@ fn run_selftest_rag(app: tauri::AppHandle) {
         Ok(m) => println!("[selftest-rag] navigate -> {}", m),
         Err(e) => println!("[selftest-rag] navigate ERR: {}", e),
     }
-    std::thread::sleep(std::time::Duration::from_secs(6));
+    // E7：自动入库现在等「正文文本稳定」（最多 6 次 ≈ 6.8s）才送存，所以这里等 9s
+    std::thread::sleep(std::time::Duration::from_secs(9));
     let after = store::stats(&app).map(|s| s.docs).unwrap_or(0);
     println!("[selftest-rag] kb after = {} (delta {})", after, after.saturating_sub(before));
     match store::search(&app, "Rust", 5) {
@@ -323,7 +325,7 @@ fn run_selftest_rag(app: tauri::AppHandle) {
         Ok(m) => println!("[selftest-rag] re-navigate -> {}", m),
         Err(e) => println!("[selftest-rag] re-navigate ERR: {}", e),
     }
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    std::thread::sleep(std::time::Duration::from_secs(9));
     let last_store = browser::list_events().into_iter().rev().find(|e| e.kind == "store" || e.kind == "store-error");
     match last_store {
         Some(e) => println!("[selftest-rag] dup check -> kind={} detail={} url={}", e.kind, e.detail, e.url),
@@ -365,6 +367,21 @@ fn run_selftest_rag(app: tauri::AppHandle) {
     let after_ttl = store::stats(&app).map(|s| s.docs).unwrap_or(0);
     println!("[selftest-rag] kb ttl check: before={} injected={} after_purge={} (expect after == before)",
         before_ttl, mid_ttl, after_ttl);
+    // E7：自检自己要清干净 —— 删掉本次导航/搜索产生的记录（rust-lang 带 c96-e2e、Bing SERP 查询是 c96 端到端检索）
+    let mut cleaned = 0;
+    if let Ok(v) = store::docs_all(&app, "", false, 0) {
+        if let Some(rows) = v.get("rows").and_then(|r| r.as_array()) {
+            for r in rows.iter() {
+                let hash = r.get(0).and_then(|x| x.as_str()).unwrap_or("");
+                let u = r.get(1).and_then(|x| x.as_str()).unwrap_or("");
+                let q = r.get(5).and_then(|x| x.as_str()).unwrap_or("");
+                if (u.contains("c96-e2e") || q == "c96 端到端检索") && store::doc_remove(&app, hash).unwrap_or(false) {
+                    cleaned += 1;
+                }
+            }
+        }
+    }
+    println!("[selftest-rag] 清理自检记录 = {}", cleaned);
     println!("[selftest-rag] done");
     app.exit(0);
 }
@@ -646,6 +663,140 @@ fn run_selftest_links(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+/// E7 无人值守自检：自动入库必须走「正文抽取」，不能把菜单/侧栏/推荐整页塞进知识库。
+///   1) 主流站布局的本地页（顶部菜单 + 正文 5 段 + 侧栏相关 + 评论区 + 页脚）
+///      → 自动入库后：正文 5 段都在，菜单/侧栏/相关/评论/页脚词一个都不在，mode=cluster
+///   2) 纯链接页（40 个导航链接）→ 被链接密度闸门跳过（KB 不增长），留下 store-skip 事件
+fn run_selftest_extract(app: tauri::AppHandle) {
+    println!("[selftest-extract] start");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let dir = std::env::temp_dir().join("c96_extract");
+    let _ = std::fs::create_dir_all(&dir);
+    let stamp = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis(),
+        Err(_) => 0,
+    };
+    let before = store::stats(&app).map(|s| s.docs).unwrap_or(0);
+
+    // ---- 页面 1：文章页（菜单 + 正文 + 侧栏 + 评论 + 页脚）----
+    let mut page = String::new();
+    page.push_str("<!doctype html><meta charset=utf-8><title>C96EXTRACT 主流站布局</title><body>");
+    page.push_str("<div class=\"top-nav\"><a href=\"#\">新闻</a><a href=\"#\">体育</a><a href=\"#\">汽车</a><a href=\"#\">房产</a><a href=\"#\">旅游</a><a href=\"#\">教育</a><a href=\"#\">时尚</a><a href=\"#\">登录</a></div>");
+    page.push_str("<div class=\"crumb\">首页 &gt; 科技 &gt; 正文</div>");
+    page.push_str("<div class=\"article-content\"><h1>C96EXTRACT-TITLE 正文标题</h1><div class=\"meta\">2026-10-12 · 来源：C96 自检</div>");
+    for i in 1..=6 {
+        page.push_str(&format!("<p>C96EXTRACT-P{} 这是正文第 {} 段：主流网站的正文往往夹在导航条、侧栏、相关推荐与评论区之间，自动入库必须只摘正文块；这一段如果没有出现在知识库里，就说明正文抽取退化成了整页 innerText。</p>", i, i));
+    }
+    page.push_str("<p>参考链接：<a href=\"https://example.com/ref\">Rust 官网</a> 之后继续正文。</p></div>");
+    page.push_str("<aside class=\"sidebar\"><div class=\"related-news\"><a href=\"#\">C96EXTRACT-REL 相关推荐一</a><a href=\"#\">C96EXTRACT-REL 相关推荐二</a></div></aside>");
+    page.push_str("<div class=\"comment-area\"><p>C96EXTRACT-COMMENT 评论区内容不该入库</p></div>");
+    page.push_str("<div class=\"footer-bar\"><a href=\"#\">关于我们</a><a href=\"#\">广告投放</a><a href=\"#\">联系方式</a></div>");
+    page.push_str("</body>");
+    let art = dir.join("article.html");
+    let _ = std::fs::write(&art, &page);
+    let art_url = format!("file:///{}?c96={}", art.to_string_lossy().replace('\\', "/"), stamp);
+    let _ = browser::raw_navigate(&app, "main", &art_url);
+    // 抽取要等文本稳定（首读 1s + 稳定判定），短页面走 6 次兜底 ≈ 7s
+    std::thread::sleep(std::time::Duration::from_secs(9));
+    let after = store::stats(&app).map(|s| s.docs).unwrap_or(0);
+    let doc = store::last(&app);
+    let text = doc.as_ref().map(|d| d.text.clone()).unwrap_or_default();
+    let doc_url_ok = doc.as_ref().map(|d| d.url.contains("article.html")).unwrap_or(false);
+    let mut p_hits = 0;
+    for i in 1..=6 {
+        if text.contains(&format!("C96EXTRACT-P{}", i)) { p_hits += 1; }
+    }
+    let mut junk: Vec<&str> = Vec::new();
+    for w in ["体育", "旅游", "登录", "C96EXTRACT-REL", "C96EXTRACT-COMMENT", "广告投放", "关于我们"] {
+        if text.contains(w) { junk.push(w); }
+    }
+    let mode = doc.as_ref().map(|d| d.mode.clone()).unwrap_or_default();
+    let mode_ok = mode == "cluster" || mode == "semantic" || mode == "article";
+    let chars = text.chars().count();
+    let one_ok = doc_url_ok && p_hits == 6 && junk.is_empty() && mode_ok && chars >= 300 && after > before;
+    println!("[selftest-extract] 1) 文章页 {}: 入库 {} 条 · 正文段落 {}/6 · {} 字 · mode={} · 混入词={:?}",
+        if one_ok { "OK" } else { "FAIL" }, after.saturating_sub(before), p_hits, chars, mode, junk);
+    if let Some(d) = doc.as_ref() {
+        let head: String = d.text.chars().take(90).collect();
+        println!("[selftest-extract]    入库开头: {}", head.replace(char::from(10), " / "));
+    }
+    let load_events: Vec<String> = browser::list_events().into_iter()
+        .filter(|e| e.url.contains("article.html") && (e.kind == "ready" || e.kind == "load"))
+        .map(|e| e.kind.clone())
+        .collect();
+    println!("[selftest-extract]    页面事件: {:?}", load_events);
+    let last_store = browser::list_events().into_iter().rev().find(|e| e.kind == "store" && e.url.contains("article.html"));
+    match last_store {
+        Some(e) => println!("[selftest-extract]    store 事件: {}", e.detail),
+        None => println!("[selftest-extract]    store 事件: 无"),
+    }
+
+    // ---- 页面 2：纯链接页（导航堆）→ 链接密度闸门应拦住 ----
+    let mut links = String::new();
+    for i in 0..40 {
+        links.push_str(&format!("<a href=\"https://example.com/l{}\">C96EXTRACT-LINK-{} 一条纯导航链接文本</a>", i, i));
+    }
+    let list_page = format!("<!doctype html><meta charset=utf-8><title>C96EXTRACT 链接堆</title><body><div class=\"listing\">{}</div></body>", links);
+    let lp = dir.join("links.html");
+    let _ = std::fs::write(&lp, &list_page);
+    let lp_url = format!("file:///{}?c96={}", lp.to_string_lossy().replace('\\', "/"), stamp + 1);
+    let before2 = store::stats(&app).map(|s| s.docs).unwrap_or(0);
+    let _ = browser::raw_navigate(&app, "main", &lp_url);
+    std::thread::sleep(std::time::Duration::from_secs(7));
+    let after2 = store::stats(&app).map(|s| s.docs).unwrap_or(0);
+    let skips: Vec<String> = browser::list_events().into_iter()
+        .filter(|e| e.kind == "store-skip" && e.url.contains("links.html"))
+        .map(|e| e.detail.clone())
+        .collect();
+    let two_ok = after2 == before2 && !skips.is_empty();
+    println!("[selftest-extract] 2) 链接堆页 {}: KB 增长 {} 条（期望 0）· store-skip {} 个 {:?}",
+        if two_ok { "OK" } else { "FAIL" }, after2.saturating_sub(before2), skips.len(), skips.first());
+
+    // ---- 清理：把自检入库的那条删掉，别污染真实知识库 ----
+    // 只删自检自己造的这条（防止误删用户知识库里最后一条）
+    let removed = match doc.as_ref() {
+        Some(d) => {
+            if d.url.contains("article.html") { store::doc_remove(&app, &d.hash).unwrap_or(false) } else { false }
+        }
+        None => false,
+    };
+    let _ = std::fs::remove_file(&art);
+    let _ = std::fs::remove_file(&lp);
+    println!("[selftest-extract] 清理自检条目 = {}（KB 现有 {} 条）", removed, store::stats(&app).map(|s| s.docs).unwrap_or(0));
+    // ---- 3)（可选）真站重访：C96_EXTRACT_LIVE=url1,url2
+    //        专门验证「旧的整页 raw 记录会被一次干净重访替换」（用户实际抱怨的那两个页面就是这么修的）
+    let live = std::env::var("C96_EXTRACT_LIVE").unwrap_or_default();
+    let live_list: Vec<&str> = live.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if !live_list.is_empty() {
+        println!("[selftest-extract] 3) 真站重访 {} 个 URL（抽取后应替换旧的整页记录）", live_list.len());
+        for u in live_list.iter() {
+            let _ = browser::raw_navigate(&app, "main", u);
+            std::thread::sleep(std::time::Duration::from_secs(13));
+            let recent: Vec<String> = browser::list_events().into_iter()
+                .filter(|e| e.kind == "store" || e.kind == "store-skip" || e.kind == "store-error")
+                .rev().take(3)
+                .map(|e| format!("{} [{}] {}", e.kind, e.url.chars().take(64).collect::<String>(), e.detail))
+                .collect();
+            println!("[selftest-extract]    {}", u);
+            for r in recent.iter().rev() { println!("[selftest-extract]      事件 {}", r); }
+            if let Ok(v) = store::docs_all(&app, "", false, 4) {
+                if let Some(rows) = v.get("rows").and_then(|r| r.as_array()) {
+                    for r in rows.iter() {
+                        let host = r.get(3).and_then(|x| x.as_str()).unwrap_or("");
+                        let len = r.get(7).and_then(|x| x.as_u64()).unwrap_or(0);
+                        let url = r.get(1).and_then(|x| x.as_str()).unwrap_or("");
+                        println!("[selftest-extract]      KB: {} {} 字 {}", host, len, url.chars().take(58).collect::<String>());
+                    }
+                }
+            }
+        }
+    }
+
+    println!("[selftest-extract] 小结: 文章页 {} · 链接堆页 {}", if one_ok { "通过" } else { "失败" }, if two_ok { "通过" } else { "失败" });
+    println!("[selftest-extract] done");
+    app.exit(0);
+}
+
 fn topic_runs(app: &tauri::AppHandle, q: &str) -> u64 {
     let key = c96::store::state::topic_key(q);
     match store::topic_list(app) {
@@ -717,6 +868,7 @@ fn main() {
     let selftest_rag = std::env::args().any(|a| a == "--selftest-rag");
     let selftest_links = std::env::args().any(|a| a == "--selftest-links");
     let selftest_rss_ui = std::env::args().any(|a| a == "--selftest-rss-ui");
+    let selftest_extract = std::env::args().any(|a| a == "--selftest-extract");
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             banner,
@@ -765,6 +917,10 @@ fn main() {
             if selftest_links {
                 let h = handle.clone();
                 std::thread::spawn(move || run_selftest_links(h));
+            }
+            if selftest_extract {
+                let h = handle.clone();
+                std::thread::spawn(move || run_selftest_extract(h));
             }
             if selftest_rss_ui {
                 let h = handle.clone();

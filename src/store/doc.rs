@@ -34,6 +34,10 @@ pub struct KbDoc {
     /// F2 正文 simhash。
     #[serde(default)]
     pub simhash: u64,
+    /// E7 抽取模式标注（GUI 浏览器自动入库）：raw（整页）/ fallback / cluster / semantic / article。
+    /// 旧行没有这个字段 → 空串，按「整页 raw」对待。
+    #[serde(default)]
+    pub mode: String,
 }
 
 pub fn now_ms() -> u64 {
