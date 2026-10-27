@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::config::toml::parse;
 use crate::config::toml::render_block;
 use crate::config::toml::Value;
+use crate::search::normalize::is_blacklisted;
 
 #[derive(Clone)]
 pub struct FetchEntry {
@@ -61,6 +62,9 @@ pub struct StoreState {
     pub topics: Vec<Topic>,
     /// 忽略名单（小写 host）：这些主机的页面不再自动收录（RSS 面板「忽略」）。
     pub ignored_hosts: Vec<String>,
+    /// URL 黑名单 glob（含 '/' 或 '://' 时匹配整条 URL，否则匹配 host）。
+    /// 内置搜索引擎结果页规则 + 用户自加规则，命中则自动收录跳过（防杂乱）。
+    pub blocked_patterns: Vec<String>,
 }
 
 /// 最多保留的主题任务数（超出丢弃 next_due 最早的）。
@@ -89,7 +93,59 @@ pub fn default_topic() -> Topic {
 }
 
 pub fn default_state() -> StoreState {
-    return StoreState { version: 1, ttl_days: 30, last_purge_ms: 0, entries: Vec::new(), topics: Vec::new(), ignored_hosts: Vec::new() };
+    return StoreState { version: 1, ttl_days: 30, last_purge_ms: 0, entries: Vec::new(), topics: Vec::new(), ignored_hosts: Vec::new(), blocked_patterns: Vec::new() };
+}
+
+/// 内置搜索引擎结果页黑名单（glob 匹配整条 URL）：导航页 / SERP 不自动收录，防止杂乱。
+/// 用户在面板里加的模式与这些合并生效；要放行某站可在面板删除规则或取消忽略。
+pub const DEFAULT_BLOCKED_PATTERNS: [&str; 13] = [
+    "*://*.bing.com/search*",
+    "*://*.bing.com/news/search*",
+    "*://*.bing.com/images/search*",
+    "*://*.bing.com/videos/search*",
+    "*://*.baidu.com/s?*",
+    "*://*.google.com/search?*",
+    "*://*.duckduckgo.com/?q*",
+    "*://*.sogou.com/web?*",
+    "*://*.so.com/s?*",
+    "*://*.yandex.com/search?*",
+    "*://*.brave.com/search?*",
+    "*://*.ecosia.org/search?*",
+    "*://*.web.bing.com/search*",
+];
+
+pub fn default_blocked_patterns() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in DEFAULT_BLOCKED_PATTERNS { out.push(p.to_string()); }
+    return out;
+}
+
+/// 命中黑名单：内置规则 + 用户自加规则，任一 glob 命中即拦下（大小写不敏感）。
+pub fn is_blocked(st: &StoreState, url: &str) -> bool {
+    if url.is_empty() { return false; }
+    let mut pats: Vec<String> = default_blocked_patterns();
+    for p in &st.blocked_patterns {
+        if !p.trim().is_empty() { pats.push(p.clone()); }
+    }
+    return is_blacklisted(url, &pats);
+}
+
+/// 加入用户黑名单（已存在 / 空 -> false）。
+pub fn block_pattern(st: &mut StoreState, pattern: &str) -> bool {
+    let p = pattern.trim();
+    if p.is_empty() { return false; }
+    if st.blocked_patterns.iter().any(|x| x == p) { return false; }
+    st.blocked_patterns.push(p.to_string());
+    st.blocked_patterns.sort();
+    return true;
+}
+
+/// 移出用户黑名单（只删用户自加项，内置规则不受影响），返回是否真删掉。
+pub fn unblock_pattern(st: &mut StoreState, pattern: &str) -> bool {
+    let p = pattern.trim();
+    let before = st.blocked_patterns.len();
+    st.blocked_patterns.retain(|x| x != p);
+    return st.blocked_patterns.len() != before;
 }
 
 /// 主题去重键（大小写/空白不敏感）。
@@ -191,6 +247,16 @@ pub fn load(path: &str) -> StoreState {
                         }
                     }
                 }
+                if k == "blocked_patterns" {
+                    if let Value::Arr(items) = &v {
+                        for it in items {
+                            if let Value::Str(s) = it {
+                                let p = s.trim();
+                                if !p.is_empty() { st.blocked_patterns.push(p.to_string()); }
+                            }
+                        }
+                    }
+                }
             }
             continue;
         }
@@ -281,6 +347,9 @@ pub fn save(path: &str, st: &StoreState) -> bool {
     let mut ign: Vec<Value> = Vec::new();
     for h in &st.ignored_hosts { ign.push(Value::Str(h.clone())); }
     meta.push(("ignored_hosts".to_string(), Value::Arr(ign)));
+    let mut blk: Vec<Value> = Vec::new();
+    for p in &st.blocked_patterns { blk.push(Value::Str(p.clone())); }
+    meta.push(("blocked_patterns".to_string(), Value::Arr(blk)));
     text = text + &render_block("meta", false, meta);
     text += "\n";
     for e in &st.entries {
@@ -401,6 +470,9 @@ mod tests {
     use super::fold;
     use super::ignore_host;
     use super::is_ignored;
+    use super::is_blocked;
+    use super::block_pattern;
+    use super::unblock_pattern;
     use super::load;
     use super::unignore_host;
     use super::save;
@@ -515,6 +587,33 @@ mod tests {
         assert_eq!(unignore_host(&mut st2, "cn.bing.com"), false);
         assert_eq!(is_ignored(&st2, "cn.bing.com"), false);
         assert_eq!(is_ignored(&st2, "www.sohu.com"), true);
+    }
+
+    #[test]
+    fn blocked_patterns_defaults_and_round_trip() {
+        let mut st = default_state();
+        // 内置 SERP 规则开箱即用
+        assert_eq!(is_blocked(&st, "https://cn.bing.com/search?q=rust"), true);
+        assert_eq!(is_blocked(&st, "https://www.bing.com/news/search?q=ai"), true);
+        assert_eq!(is_blocked(&st, "https://www.baidu.com/s?wd=rust"), true);
+        assert_eq!(is_blocked(&st, "https://blog.example.com/post?id=7"), false);
+        // 用户自加规则
+        assert!(block_pattern(&mut st, "*.tracker.net"));
+        assert_eq!(block_pattern(&mut st, "*.tracker.net"), false);
+        assert_eq!(block_pattern(&mut st, "   "), false);
+        assert_eq!(is_blocked(&st, "https://x.tracker.net/y"), true);
+        assert!(save("_scratch/f_state_blocked.toml", &st));
+        let back = load("_scratch/f_state_blocked.toml");
+        assert_eq!(back.blocked_patterns, vec!["*.tracker.net".to_string()]);
+        assert_eq!(is_blocked(&back, "https://x.tracker.net/y"), true);
+        assert_eq!(is_blocked(&back, "https://cn.bing.com/search?q=1"), true);
+        let mut st2 = back.clone();
+        assert_eq!(unblock_pattern(&mut st2, "*.tracker.net"), true);
+        assert_eq!(unblock_pattern(&mut st2, "*.tracker.net"), false);
+        assert_eq!(is_blocked(&st2, "https://x.tracker.net/y"), false);
+        // 内置规则不可被 unblock 删掉
+        assert_eq!(unblock_pattern(&mut st2, "*://*.bing.com/search*"), false);
+        assert_eq!(is_blocked(&st2, "https://cn.bing.com/search?q=2"), true);
     }
 
     #[test]

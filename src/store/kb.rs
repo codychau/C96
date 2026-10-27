@@ -216,6 +216,10 @@ impl Store {
         if state::is_ignored(&self.state, &host) {
             return Ok(format!("skip: ignored host {} (取消忽略后才会再收录)", host));
         }
+        // URL 黑名单（内置搜索引擎结果页 + 用户自加规则）：导航页/SERP 不进库，防止杂乱
+        if state::is_blocked(&self.state, url) {
+            return Ok(format!("skip: blocked pattern (黑名单命中，{} 不收录)", url));
+        }
         let hash = url_key(url);
         if self.seen.contains(&hash) { return Ok("skip: duplicate url".to_string()); }
         let sh = title_shingle(title);
@@ -688,18 +692,44 @@ mod tests {
         // 忽略名单落盘
         let reopened = Store::open(&p, 30).unwrap();
         assert_eq!(reopened.state().ignored_hosts.len(), 1);
-        let msg = s.save("https://cn.bing.com/search?q=x", "词典", "should not be stored at all", "", "gui-browser", 0).unwrap();
+        let msg = s.save("https://cn.bing.com/dictionary?q=x", "词典", "should not be stored at all", "", "gui-browser", 0).unwrap();
         assert!(msg.starts_with("skip: ignored host"), "{}", msg);
         assert_eq!(s.stats().docs, 0);
         // 取消忽略后立刻恢复收录
         state::unignore_host(s.state_mut(), "CN.BING.COM");
         assert!(s.persist_state());
-        let ok = s.save("https://cn.bing.com/search?q=x", "词典", "now allowed to store", "", "gui-browser", 0).unwrap();
+        let ok = s.save("https://cn.bing.com/dictionary?q=x", "词典", "now allowed to store", "", "gui-browser", 0).unwrap();
         assert!(ok.starts_with("stored:"), "{}", ok);
         assert_eq!(s.stats().docs, 1);
         let back = Store::open(&p, 30).unwrap();
         assert_eq!(back.state().ignored_hosts.len(), 0);
         assert_eq!(back.stats().docs, 1);
+    }
+
+    #[test]
+    fn save_skips_default_search_engine_serp() {
+        let p = kb("f_kb_serp.jsonl");
+        let mut s = Store::open(&p, DEFAULT_TTL_DAYS).unwrap();
+        // 内置黑名单：搜索引擎结果页即便有正文也不入库（防杂乱）
+        let bing = s.save("https://cn.bing.com/search?q=rust", "搜索结果", "一二三搜索结果页正文很长很长很长", "", "gui-browser", 0).unwrap();
+        assert!(bing.starts_with("skip: blocked pattern"), "{}", bing);
+        let news = s.save("https://www.bing.com/news/search?q=ai", "新闻搜索", "新闻搜索结果页正文很长很长", "", "gui-browser", 0).unwrap();
+        assert!(news.starts_with("skip: blocked pattern"), "{}", news);
+        assert_eq!(s.stats().docs, 0);
+        // 同一 host 的非 SERP 文章页照常收录
+        let art = s.save("https://www.bing.com/articles/1", "文章", "这是一篇正常的 Bing 文章正文。", "", "gui-browser", 0).unwrap();
+        assert!(art.starts_with("stored:"), "{}", art);
+        assert_eq!(s.stats().docs, 1);
+        // 用户自加规则命中
+        state::block_pattern(s.state_mut(), "*://news.example.com/*");
+        assert!(s.persist_state());
+        let blk = s.save("https://news.example.com/x", "标题", "被用户黑名单拦下", "", "gui-browser", 0).unwrap();
+        assert!(blk.starts_with("skip: blocked pattern"), "{}", blk);
+        // 删除规则后放行
+        assert_eq!(state::unblock_pattern(s.state_mut(), "*://news.example.com/*"), true);
+        let through = s.save("https://news.example.com/y", "标题2", "规则删除后放行入库正文", "", "gui-browser", 0).unwrap();
+        assert!(through.starts_with("stored:"), "{}", through);
+        assert_eq!(s.stats().docs, 2);
     }
     #[test]
     fn recapture_replaces_raw_doc_with_cleaner_extract() {

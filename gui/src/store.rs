@@ -304,6 +304,27 @@ pub fn ignore_host(app: &AppHandle, host: &str, on: bool) -> Result<bool, String
     return Ok(changed);
 }
 
+/// 用户自加的 URL 黑名单 glob（内置 SERP 规则不在此列表里，但生效时合并）。
+pub fn blocked_patterns(app: &AppHandle) -> Result<Vec<String>, String> {
+    return with(app, |s| s.state().blocked_patterns.clone());
+}
+
+/// 面板用：内置 SERP 规则 + 用户黑名单，一次回传。
+pub fn patterns_info(app: &AppHandle) -> Result<serde_json::Value, String> {
+    let user = blocked_patterns(app)?;
+    let built = c96::store::state::default_blocked_patterns();
+    return serde_json::to_value(serde_json::json!({ "built_in": built, "user": user })).map_err(|e| e.to_string());
+}
+
+/// 加/删用户黑名单 glob（内置规则不可删）；返回状态是否真的变了。
+pub fn pattern_block(app: &AppHandle, pattern: &str, on: bool) -> Result<bool, String> {
+    let arc = handle(app)?;
+    let mut g = arc.lock().unwrap_or_else(|e| e.into_inner());
+    let changed = if on { c96::store::state::block_pattern(g.state_mut(), pattern) } else { c96::store::state::unblock_pattern(g.state_mut(), pattern) };
+    if changed { let _ = g.persist_state(); }
+    return Ok(changed);
+}
+
 /// 注入面板的请求分发器（走 WebView2 原生 postMessage 通道，不用 Tauri IPC：
 /// 外部页面/ file:// 的 Origin 不被 IPC 接受，实测报 "Origin header is not a valid URL"）。
 pub fn rss_op(app: &AppHandle, op: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -348,6 +369,9 @@ pub fn rss_op(app: &AppHandle, op: &str, args: &serde_json::Value) -> Result<ser
             let on = args.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
             return serde_json::to_value(ignore_host(app, &sarg("host"), on)?).map_err(|e| e.to_string());
         }
+        "patterns" => { return patterns_info(app); }
+        "pattern_add" => { return serde_json::to_value(pattern_block(app, &sarg("pattern"), true)?).map_err(|e| e.to_string()); }
+        "pattern_remove" => { return serde_json::to_value(pattern_block(app, &sarg("pattern"), false)?).map_err(|e| e.to_string()); }
         _ => { return Err("unknown rss op: ".to_string() + op); }
     }
 }

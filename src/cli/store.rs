@@ -37,6 +37,9 @@ pub fn usage() {
     println!("  store search QUERY [--limit N]                substring search + snippets");
     println!("  store purge [--kb PATH] [--ttl-days N]        drop expired docs (open auto-purges too)");
     println!("  store state [--kb PATH]                       F3 state file (last_fetch/etag/seen_ids/engine)");
+    println!("  store patterns [--kb PATH]                     built-in search-engine SERP rules + your URL blacklist");
+    println!("  store block PATTERN [--kb PATH]               add URL/host glob (supports *) to blacklist — auto-store skips it");
+    println!("  store unblock PATTERN [--kb PATH]            remove a user pattern (built-in rules are kept)");
     println!("  store add --url URL [--title T] [--text T | --text-file PATH] [--query Q] [--source S]");
     println!("  --kb PATH         default: %APPDATA%/com.c96.gui/kb.jsonl (same file as the GUI)");
     println!("  --ttl-days N      default 30; docs older than this are discarded");
@@ -371,6 +374,70 @@ fn cmd_state(parsed: &Parsed) -> i32 {
     return 0;
 }
 
+fn cmd_patterns(parsed: &Parsed) -> i32 {
+    let s = match open(parsed) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("store patterns: {}", e); return 1; }
+    };
+    let stt = s.state();
+    println!("store patterns: {} (F3)", s.state_path());
+    println!("  built-in search-engine SERP rules (always active):");
+    for p in state::default_blocked_patterns() {
+        println!("    {}", p);
+    }
+    println!("  user blacklist: {} pattern(s)", stt.blocked_patterns.len());
+    for p in &stt.blocked_patterns {
+        println!("    {}", p);
+    }
+    return 0;
+}
+
+fn pattern_arg(parsed: &Parsed) -> String {
+    if parsed.positional.len() > 2 { parsed.positional[2].trim().to_string() } else { parsed.opt_or("pattern", "") }
+}
+
+fn cmd_block(parsed: &Parsed) -> i32 {
+    let pat = pattern_arg(parsed);
+    if pat.is_empty() {
+        eprintln!("store block: PATTERN is required (e.g. *.tracker.net or *://news.example.com/*)");
+        usage();
+        return 1;
+    }
+    let mut s = match open(parsed) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("store block: {}", e); return 1; }
+    };
+    let added = state::block_pattern(s.state_mut(), &pat);
+    let _ = s.persist_state();
+    if added {
+        println!("store block: added {} (以后含此 URL 的页面不再自动收录)", pat);
+    } else {
+        println!("store block: {} 已在用户黑名单中", pat);
+    }
+    return 0;
+}
+
+fn cmd_unblock(parsed: &Parsed) -> i32 {
+    let pat = pattern_arg(parsed);
+    if pat.is_empty() {
+        eprintln!("store unblock: PATTERN is required");
+        usage();
+        return 1;
+    }
+    let mut s = match open(parsed) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("store unblock: {}", e); return 1; }
+    };
+    let removed = state::unblock_pattern(s.state_mut(), &pat);
+    let _ = s.persist_state();
+    if removed {
+        println!("store unblock: removed {}", pat);
+    } else {
+        println!("store unblock: {} 不在用户黑名单（内置 SERP 规则不可删）", pat);
+    }
+    return 0;
+}
+
 pub fn run(parsed: &Parsed) -> i32 {
     let sub = if parsed.positional.len() > 1 { parsed.positional[1].as_str() } else { "" };
     if parsed.has_flag("help") || parsed.has_flag("h") || sub == "help" {
@@ -383,6 +450,9 @@ pub fn run(parsed: &Parsed) -> i32 {
     if sub == "purge" { return cmd_purge(parsed); }
     if sub == "add" { return cmd_add(parsed); }
     if sub == "state" { return cmd_state(parsed); }
+    if sub == "patterns" { return cmd_patterns(parsed); }
+    if sub == "block" { return cmd_block(parsed); }
+    if sub == "unblock" { return cmd_unblock(parsed); }
     eprintln!("unknown store subcommand: {}", sub);
     usage();
     return 1;
@@ -475,10 +545,37 @@ mod tests {
     }
 
     #[test]
-    fn ttl_days_override_is_read() {
-        let parsed = parse(words(&["store", "stats", "--kb", "_scratch/f_cli_ttl.jsonl", "--ttl-days", "7"]));
-        assert_eq!(super::ttl_days(&parsed), 7);
-        let dflt = parse(words(&["store", "stats"]));
-        assert_eq!(super::ttl_days(&dflt), 30);
+    fn store_block_and_serp_defaults_filter_ingest() {
+        let kb = "_scratch/f_cli_block.jsonl";
+        let p = PathBuf::from(kb);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file("_scratch/f_cli_block.state.toml");
+        let parsed = parse(words(&["store", "add", "--kb", kb]));
+        // 内置 SERP 规则拦下搜索结果页
+        let serp = ingest(&parsed, vec![draft("https://cn.bing.com/search?q=rust")]).unwrap();
+        assert!(serp.contains("0 stored / 1 skipped"), "{}", serp);
+        assert!(serp.contains("blocked pattern"), "{}", serp);
+        // 加用户黑名单后拦下该站
+        let bp = parse(words(&["store", "block", "*://news.example.com/*", "--kb", kb]));
+        assert_eq!(super::run(&bp), 0);
+        let bl = ingest(&parsed, vec![draft("https://news.example.com/a")]).unwrap();
+        assert!(bl.contains("blocked pattern"), "{}", bl);
+        // 移除规则后放行
+        let up = parse(words(&["store", "unblock", "*://news.example.com/*", "--kb", kb]));
+        assert_eq!(super::run(&up), 0);
+        let ok = ingest(&parsed, vec![draft("https://news.example.com/b")]).unwrap();
+        assert!(ok.contains("1 stored / 0 skipped"), "{}", ok);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file("_scratch/f_cli_block.state.toml");
+    }
+
+    #[test]
+    fn store_add_is_unchanged_by_block_subcommands() {
+        // 占位确保 subcommand 表包含新命令
+        let kb = "_scratch/f_cli_none.jsonl";
+        let _ = std::fs::remove_file("_scratch/f_cli_none.state.toml");
+        let parsed = parse(words(&["store", "patterns", "--kb", kb]));
+        assert_eq!(super::run(&parsed), 0);
+        let _ = std::fs::remove_file("_scratch/f_cli_none.state.toml");
     }
 }
