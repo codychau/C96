@@ -66,7 +66,7 @@ fn gui_dir(gui: &Path, cwd: &Path) -> PathBuf {
 /// 上创建进程时 inherit_handles=TRUE），于是 `C96 gui | more` 这类带管道的调用会一直挂住
 /// 直到 GUI 退出。ShellExecuteW 由 shell 创建进程，不继承调用方的句柄。
 #[cfg(windows)]
-fn spawn(gui: &Path, cwd: &Path) -> Result<PathBuf, String> {
+fn spawn(gui: &Path, cwd: &Path, silent: bool) -> Result<PathBuf, String> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
 
@@ -79,12 +79,15 @@ fn spawn(gui: &Path, cwd: &Path) -> Result<PathBuf, String> {
     let file = wide(gui.as_os_str());
     let op = wide(OsStr::new("open"));
     let dir = wide(gui_dir(gui, cwd).as_os_str());
+    // 静默：给 GUI 传 --silent，让它以隐藏窗口方式启动（已运行则不唤窗）。
+    let params = wide(OsStr::new("--silent"));
+    let params_ptr: *const u16 = if silent { params.as_ptr() } else { core::ptr::null() };
     let rc = unsafe {
         ShellExecuteW(
             core::ptr::null_mut(),
             op.as_ptr(),
             file.as_ptr(),
-            core::ptr::null(),
+            params_ptr,
             dir.as_ptr(),
             1,
         )
@@ -98,21 +101,27 @@ fn spawn(gui: &Path, cwd: &Path) -> Result<PathBuf, String> {
 
 /// 非 Windows：普通分离进程。
 #[cfg(not(windows))]
-fn spawn(gui: &Path, cwd: &Path) -> Result<PathBuf, String> {
-    std::process::Command::new(gui)
-        .current_dir(gui_dir(gui, cwd))
+fn spawn(gui: &Path, cwd: &Path, silent: bool) -> Result<PathBuf, String> {
+    let mut cmd = std::process::Command::new(gui);
+    cmd.current_dir(gui_dir(gui, cwd))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+    if silent {
+        cmd.arg("--silent");
+    }
+    cmd.spawn()
         .map_err(|e| format!("spawn {} failed: {}", gui.display(), e))?;
     return Ok(gui.to_path_buf());
 }
 
 /// 拉起 GUI 进程（分离启动，立即返回）。
 ///
+/// `silent=true`（`C96 gui --silent`）：透传 `--silent` 给 GUI —— 未启动则以隐藏
+/// 窗口方式启动；已启动则不唤起其窗口（由 GUI 的单实例逻辑处理）。
+///
 /// 可用环境变量 `C96_GUI` 显式指定 GUI 可执行文件路径。
-pub fn launch() -> Result<PathBuf, String> {
+pub fn launch(silent: bool) -> Result<PathBuf, String> {
     let exe_dir: PathBuf = match std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
         Some(d) => d,
         None => return Err("cannot resolve CLI executable directory".to_string()),
@@ -121,11 +130,11 @@ pub fn launch() -> Result<PathBuf, String> {
     if let Ok(env_path) = std::env::var("C96_GUI") {
         let p = PathBuf::from(env_path);
         if p.is_file() {
-            return spawn(&p, &cwd);
+            return spawn(&p, &cwd, silent);
         }
     }
     match find_gui(&exe_dir, &cwd) {
-        Some(p) => return spawn(&p, &cwd),
+        Some(p) => return spawn(&p, &cwd, silent),
         None => {
             let tried: Vec<String> = candidates(&exe_dir, &cwd).iter().map(|p| p.display().to_string()).collect();
             return Err(format!(

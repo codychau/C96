@@ -44,6 +44,7 @@ fn usage() {
     println!("  index stats|query|bench            BM25 index: char-code terms + weights (G)");
     println!("  rss serve|urls|opml                local RSS server: topics -> feeds (I3/I4)");
     println!("  gui                              launch the Tauri GUI (double-click / no args does this too)");
+    println!("  gui --silent                     silent mode: start hidden (no window); if already running, do NOT raise it");
     println!("  banner                            print project banner");
     println!("  help | --help                     this text");
     println!("  --version                         version + toolchain");
@@ -111,7 +112,7 @@ fn main() {
     }
     if cmd == "" && !parsed.has_flag("help") && !parsed.has_flag("h") {
         // 双击（无参数）：优先拉起 GUI 进程；GUI 未构建时回退到 usage。
-        match cli::gui::launch() {
+        match cli::gui::launch(false) {
             Ok(p) => {
                 println!("C96 GUI 已启动：{}", p.display());
                 std::process::exit(0);
@@ -124,9 +125,14 @@ fn main() {
         }
     }
     if cmd == "gui" {
-        match cli::gui::launch() {
+        let silent = parsed.has_flag("silent") || parsed.has_flag("hidden");
+        match cli::gui::launch(silent) {
             Ok(p) => {
-                println!("C96 GUI 已启动：{}", p.display());
+                if silent {
+                    println!("C96 GUI 静默启动：{}（窗口隐藏；若已在运行则不唤窗）", p.display());
+                } else {
+                    println!("C96 GUI 已启动：{}", p.display());
+                }
                 std::process::exit(0);
             }
             Err(e) => {

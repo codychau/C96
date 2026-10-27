@@ -788,6 +788,35 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     var hList = document.createElement("div");
     hList.id = "c96-rss-hosts";
     hList.textContent = "加载中…";
+    // 黑名单：内置搜索引擎结果页规则 + 用户自加 glob（含此 URL 的页面不再自动收录）
+    var bTitle = document.createElement("div");
+    bTitle.setAttribute("style", "color:#93c5fd;margin:12px 0 4px;");
+    bTitle.textContent = "URL 黑名单 ";
+    var bCount = document.createElement("span");
+    bCount.id = "c96-rss-bcount";
+    bCount.setAttribute("style", "color:#9aa4b2;font-size:12px;");
+    bTitle.appendChild(bCount);
+    var bAddBox = document.createElement("div");
+    bAddBox.setAttribute("style", "display:flex;gap:6px;margin:2px 0 4px;");
+    var bp = document.createElement("input");
+    bp.id = "c96-rss-bpat";
+    bp.placeholder = "加入黑名单：*.tracker.net 或 *://news.example.com/*（支持 *）";
+    bp.setAttribute("style", "flex:1;height:26px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 8px;font:12px system-ui;");
+    var badd = rssBtnNew("加入黑名单", "c96-rss-badd", "#93c5fd");
+    badd.addEventListener("click", function () {
+      var raw = (bp.value || "").trim();
+      if (!raw) { rssStatus("请输入黑名单规则"); return; }
+      ipc("pattern_add", { pattern: raw }).then(function (ok) {
+        rssStatus(ok ? "已加入黑名单：" + raw + "（含此 URL 的页面不再自动收录）" : "该规则已存在");
+        bp.value = "";
+        return reloadPatterns();
+      }).catch(function (e) { rssStatus("加入黑名单失败：" + e); });
+    });
+    bAddBox.appendChild(bp);
+    bAddBox.appendChild(badd);
+    var bList = document.createElement("div");
+    bList.id = "c96-rss-block";
+    bList.textContent = "加载中…";
     p.appendChild(head);
     p.appendChild(urls);
     p.appendChild(addBox);
@@ -798,6 +827,9 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     p.appendChild(dList);
     p.appendChild(hTitle);
     p.appendChild(hList);
+    p.appendChild(bTitle);
+    p.appendChild(bAddBox);
+    p.appendChild(bList);
     p.appendChild(sTitle);
     p.appendChild(sList);
     (document.body || document.documentElement).appendChild(p);
@@ -1079,12 +1111,53 @@ pub const OVERLAY_INIT: &str = r##"(function () {
   function reloadHosts() {
     return ipc("hosts").then(function (rows) { renderRssHosts(rows || []); }).catch(function () {});
   }
+  // 黑名单：内置规则只读、用户自加规则可删；命中该 glob 的页面不再自动收录
+  function rssPatternRow(pat, editable) {
+    var line = document.createElement("div");
+    line.setAttribute("style", "display:flex;align-items:center;gap:6px;font-size:12px;padding:2px 0;");
+    var nm = document.createElement("span");
+    nm.textContent = pat;
+    nm.setAttribute("style", "flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-family:monospace;color:" + (editable ? "#e6e6e6" : "#6b7280") + ";");
+    line.appendChild(nm);
+    if (editable) {
+      var del = rssBtnNew("删除", null, "#f87171");
+      del.addEventListener("click", function (ev) {
+        var b = ev.currentTarget;
+        if (b.getAttribute("data-armed") !== "1") { b.setAttribute("data-armed", "1"); b.textContent = "确认删除?"; return; }
+        ipc("pattern_remove", { pattern: pat }).then(function (ok) {
+          rssStatus(ok ? "已删除规则：" + pat : "规则不存在（内置规则不可删）");
+          return reloadPatterns();
+        }).catch(function (e) { rssStatus("删除规则失败：" + e); });
+      });
+      line.appendChild(del);
+    } else {
+      var tag = document.createElement("span");
+      tag.textContent = "内置";
+      tag.setAttribute("style", "color:#6b7280;white-space:nowrap;");
+      line.appendChild(tag);
+    }
+    return line;
+  }
+  function renderPatterns(info) {
+    var el = document.getElementById("c96-rss-block");
+    var cnt = document.getElementById("c96-rss-bcount");
+    if (!el) { return; }
+    var built = (info && info.built_in) ? info.built_in : [];
+    var user = (info && info.user) ? info.user : [];
+    el.textContent = "";
+    if (cnt) { cnt.textContent = "(内置 " + built.length + " · 用户 " + user.length + ")"; }
+    for (var i = 0; i < user.length; i++) { el.appendChild(rssPatternRow(user[i], true)); }
+    for (var j = 0; j < built.length; j++) { el.appendChild(rssPatternRow(built[j], false)); }
+  }
+  function reloadPatterns() {
+    return ipc("patterns").then(function (info) { renderPatterns(info || {}); }).catch(function () {});
+  }
   function reloadSources() {
     return ipc("rss_sources").then(function (rows) { renderRssSources(rows || []); }).catch(function () {});
   }
   // 删/清空/忽略后只刷列表（不动关键词订阅，避免把已展开的条目收起来）
   function refreshLists() {
-    return Promise.all([reloadSources(), reloadHosts(), reloadDocs()]).then(function () {});
+    return Promise.all([reloadSources(), reloadHosts(), reloadDocs(), reloadPatterns()]).then(function () {});
   }
   function renderRssUrls() {
     var el = document.getElementById("c96-rss-urls");
@@ -1134,7 +1207,8 @@ pub const OVERLAY_INIT: &str = r##"(function () {
         ipc("topic_list").catch(function (e) { return { err: String(e) }; }),
         ipc("rss_sources").catch(function () { return []; }),
         ipc("hosts").catch(function () { return []; }),
-        ipc("docs", { filter: rssFilter(), only_unsub: rssOnlyUnsub(), limit: 300 }).catch(function (e) { return { err: String(e) }; })
+        ipc("docs", { filter: rssFilter(), only_unsub: rssOnlyUnsub(), limit: 300 }).catch(function (e) { return { err: String(e) }; }),
+        ipc("patterns").catch(function () { return { built_in: [], user: [] }; })
       ]);
     }).then(function (res) {
       var ts = (res[0] && res[0].length !== undefined) ? res[0] : [];
@@ -1142,9 +1216,11 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       renderRssSources(res[1] || []);
       renderRssHosts(res[2] || []);
       renderRssDocs(res[3] || {});
+      renderPatterns(res[4] || {});
       var bad = (res[0] && res[0].err) ? " · IPC 错误: " + res[0].err : "";
       var shown = (res[3] && res[3].shown !== undefined) ? res[3].shown : 0;
-      rssStatus("订阅 " + ts.length + " 个 · 来源 " + ((res[1] || []).length) + " 个 · 主机 " + ((res[2] || []).length) + " 个 · 内容 " + shown + " 条" + bad);
+      var bl = ((res[4] && res[4].user) ? res[4].user.length : 0);
+      rssStatus("订阅 " + ts.length + " 个 · 来源 " + ((res[1] || []).length) + " 个 · 主机 " + ((res[2] || []).length) + " 个 · 内容 " + shown + " 条 · 用户黑名单 " + bl + " 条" + bad);
     }).catch(function (e) { rssStatus("加载失败：" + e); });
   }
   function toggleRssPanel() {
@@ -1234,13 +1310,16 @@ pub fn open(app: &AppHandle, url: &str) -> Result<String, String> {
     return Ok("opened browser window -> ".to_string() + &current + " | " + &status);
 }
 /// E3：主窗口 = 浏览器（外部 URL）+ C96 叠加搜索条 + 自动 RAG 采集。
-pub fn open_main(app: &AppHandle, start_url: &str) -> Result<String, String> {
+/// `visible=false`（静默模式）：创建即隐藏窗口，后台 RSS / 调度照常跑，
+/// 之后由单实例回调（非静默再次调用）唤出。
+pub fn open_main(app: &AppHandle, start_url: &str, visible: bool) -> Result<String, String> {
     let parsed = tauri::Url::parse(start_url).map_err(|e| format!("invalid url: {}", e))?;
     let nav_app = app.clone();
     let load_app = app.clone();
     let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(parsed))
         .title("C96 — 浏览器 / RAG 采集")
         .inner_size(1280.0, 860.0)
+        .visible(visible)
         .initialization_script(LINKS_INIT)
         .initialization_script(SNAPSHOT_INIT)
         .initialization_script(EXTRACT_INIT)

@@ -59,18 +59,21 @@
 - **删**：订阅删除、单条内容删除、**按站点清空**，全部二次确认
 - **全部内容**：列出库里所有条目（含随便浏览自动收录的那批），可按 标题 / 网址 / 主机 / 来源 过滤；「只看随手收录」只留不属于任何现存订阅的
 - **忽略**：把某个站点加入忽略名单，之后不再自动收录（存在 `state.toml` 的 `[meta] ignored_hosts`）
+- **URL 黑名单**：内置搜索引擎结果页规则（Bing/Baidu/Google/DuckDuckGo/Sogou/… 的 SERP/导航页永不自动入库，防杂乱），面板可再加自定 glob（`*.tracker.net` 或 `*://news.example.com/*`）；命中记为 `store-skip`，内置规则不可删。CLI：`C96 store patterns` / `C96 store block PATTERN` / `C96 store unblock PATTERN`（存在 `state.toml` 的 `[meta] blocked_patterns`）
 
 ## 快速开始
 
 ### 1. 构建
 ```powershell
 cargo build --release                 # 核心 CLI → target/release/C96.exe
-cargo test --offline                  # 103/103（lib 85 + bin 18）
+cargo test --offline                  # 107/107（lib 88 + bin 19）
 cd gui ; cargo build --release        # GUI → gui/target/release/c96-gui.exe
 ```
 
 ### 2. GUI（双击即用）
 把 `C96.exe` 与 `c96-gui.exe` 放同一目录，或保持 `gui/target/{release,debug}/` 布局；双击 `C96.exe`（无参数）就会拉起 GUI。也可以 `C96 gui`；找不到 GUI 时打印用法提示，`C96_GUI` 环境变量可显式指定路径。
+
+**单实例 + 静默模式**：GUI 现在是单实例 —— 已经开着时再 `C96 gui` 不会多开进程，而是把已有窗口唤起置顶。给 AI / 脚本用的静默参数 `C96 gui --silent`：没启动就以**隐藏窗口**后台启动（RSS 服务、关键词调度照常跑），已经启动则**不唤起它的窗口**，桌面零打扰。
 
 ### 3. 局域网 RSS
 ```powershell
@@ -112,7 +115,7 @@ C96 fetch --url https://example.com --store       # 单次抓取（ETag 缓存�
 | 东西 | 位置 / 开关 |
 |---|---|
 | 知识库 | `%APPDATA%\com.c96.gui\kb.jsonl`（`--kb PATH` 覆盖） |
-| 抓取状态 / 订阅任务 / 忽略名单 | 同目录 `kb.state.toml`（`[[fetch]]` / `[[topic]]` / `[meta] ignored_hosts`） |
+| 抓取状态 / 订阅任务 / 忽略名单 / URL 黑名单 | 同目录 `kb.state.toml`（`[[fetch]]` / `[[topic]]` / `[meta] ignored_hosts` / `[meta] blocked_patterns`） |
 | HTTP 缓存（ETag / Last-Modified） | `cache/http_cache.toml` |
 | 用户偏好 + `[[feeds]]` | `config/feeds.toml`（当前目录没有就找 exe 同级） |
 | RSS 监听地址 | `C96_RSS_BIND`（默认 `127.0.0.1:8787`） |
@@ -147,14 +150,14 @@ TTL 默认 30 天，`--ttl-days N` 覆盖。数据都在 `%APPDATA%` 下，换�
 
 ## 测试
 ```powershell
-cargo test --offline                          # 104/104（lib 86 + bin 18）
+cargo test --offline                          # 107/107（lib 88 + bin 19）
 cd gui
 .\target\debug\c96-gui.exe --selftest-rag     # 自动入库 + 指纹去重 + TTL
 .\target\debug\c96-gui.exe --selftest-extract # 正文抽取：菜单/侧栏/推荐不进门 + 链接堆页被拦住
 #   C96_EXTRACT_LIVE='<url1>,<url2>' 可顺手验证真站重访（旧的整页记录会被替换成正文）
 .\target\debug\c96-gui.exe --selftest-topics  # 关键词订阅（首搜 / 命中 / 后台刷新）
 .\target\debug\c96-gui.exe --selftest-links   # target=_blank / window.open 点击
-.\target\debug\c96-gui.exe --selftest-rss-ui  # RSS 内容管理器（增删改查 + 忽略站点）
+.\target\debug\c96-gui.exe --selftest-rss-ui  # RSS 内容管理器（增删改查 + 忽略站点 + URL 黑名单）
 ```
 
 ## License

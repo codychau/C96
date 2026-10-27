@@ -869,7 +869,25 @@ fn main() {
     let selftest_links = std::env::args().any(|a| a == "--selftest-links");
     let selftest_rss_ui = std::env::args().any(|a| a == "--selftest-rss-ui");
     let selftest_extract = std::env::args().any(|a| a == "--selftest-extract");
+    // 静默模式（C96 gui --silent）：主窗口创建即隐藏，后台 RSS / 调度照常跑；
+    // 自检需要窗口交互，强制可见。
+    let silent = std::env::args().any(|a| a == "--silent" || a == "--hidden");
+    let any_selftest = selftest || selftest_topics || selftest_rag
+        || selftest_links || selftest_rss_ui || selftest_extract;
+    let visible = any_selftest || !silent;
     tauri::Builder::default()
+        // 单实例：再次 `C96 gui` 不再开新进程，而是转发参数给已在跑的实例。
+        // 非静默调用 → 唤起已有窗口；带 --silent 的调用（AI 后台调取）→ 不唤窗。
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|a| a == "--silent" || a == "--hidden") {
+                return;
+            }
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .invoke_handler(tauri::generate_handler![
             banner,
             open_browser,
@@ -897,7 +915,7 @@ fn main() {
         .setup(move |app| {
             let handle = app.handle().clone();
             // 默认（含 --selftest）：主窗口 = 对外浏览器，先 about:blank，装好接收器再导航。
-            if let Err(e) = browser::open_main(&handle, "about:blank") {
+            if let Err(e) = browser::open_main(&handle, "about:blank", visible) {
                 println!("[c96] open_main ERR: {}", e);
             }
             let boot = handle.clone();

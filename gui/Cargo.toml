@@ -18,6 +18,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # F：复用根 crate 的存储层（统一 KB 文件 + 指纹去重 + 30 天 TTL）
 c96 = { path = "..", package = "C96" }
+tauri-plugin-single-instance = "2"
 
 # E1：webview2-rs（microsoft/webview2-rs 的 webview2-com）+ Win32 绑定。
 # 仅 Windows；版本与 Tauri 2.12 的 webview2-com ^0.39 / windows ^0.62 对齐。
