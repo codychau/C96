@@ -30,7 +30,9 @@ fn usage() {
     println!("  --engine auto|bing|baidu   default auto");
     println!("  --site HOST       站点限制（可选）");
     println!("  --max N           候选上限，default 20");
-    println!("  --fetch N         每次刷新抓取的正文页数，default 5");
+    println!("  --fetch N         每次刷新抓取的正文页数，default {}", research::DEFAULT_FETCH_N);
+    println!("  --headless        用 ureq HTTP 抓（无浏览器；部分站 403，正文短的会被跳过）");
+    println!("  （默认：把 --query 交给已在跑的 GUI 用浏览器逐页爬，过反爬；无 GUI 时回退 ureq）");
     println!("  --interval SECS   刷新间隔，default {}（到点自动再搜）", research::DEFAULT_INTERVAL_SECS);
     println!("  --fresh SECS      新鲜期，default {}（期内直接读 RAG，不联网）", research::DEFAULT_FRESH_SECS);
     println!("  --json            输出 JSON（给 AI / 脚本）");
@@ -144,6 +146,21 @@ pub fn run(parsed: &Parsed) -> i32 {
     if parsed.has_flag("help") || parsed.has_flag("h") {
         usage();
         return 0;
+    }
+    // 默认把搜索交给已在跑的 GUI，用浏览器逐页爬候选正文（能过反爬）；
+    // 显式 --cache-only / --headless / --watch 时走 ureq 核心路径。
+    {
+        let q = parsed.opt_or("query", "");
+        if !q.is_empty() && !parsed.has_flag("cache-only") && !parsed.has_flag("headless") && !parsed.has_flag("watch") {
+            let silent = parsed.has_flag("silent");
+            match crate::cli::gui::launch(silent, &q) {
+                Ok(p) => {
+                    println!("已交给 GUI（{}）用浏览器逐页爬取 \"{}\"：小窗，窗口在屏内可见才渲染（静默不抢焦点，浏览器静音）", p.display(), q);
+                    return 0;
+                }
+                Err(e) => { println!("[research] GUI 不可用（{}）：回退 ureq 抓取", e); }
+            }
+        }
     }
     let spec = match spec_of(parsed) {
         Ok(s) => s,

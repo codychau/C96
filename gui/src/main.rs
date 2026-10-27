@@ -203,16 +203,9 @@ fn boot_main(app: tauri::AppHandle) {
         }
         Err(e) => println!("[c96] 主题任务 ERR: {}", e),
     }
-    // 常驻调度：程序一直运行 -> 到期自动再搜一次并写 RAG（用户原则 1）
-    match store::handle(&app) {
-        Ok(arc) => {
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let tick = c96::research::DEFAULT_SCHED_TICK_SECS;
-            let _h = c96::research::spawn_scheduler(arc, store::run_opts(), tick, stop, Box::new(|m| println!("{}", m)));
-            println!("[c96] 主题调度线程: 启动（tick={}s，到期任务自动刷新）", tick);
-        }
-        Err(e) => println!("[c96] 主题调度 ERR: {}", e),
-    }
+    // 常驻调度：程序一直运行 -> 到点的订阅用浏览器逐页爬正文入库（能过反爬）
+    spawn_crawl_scheduler(app.clone());
+    println!("[c96] 浏览器调度器: 启动（tick={}s，到期订阅自动逐页爬）", c96::research::DEFAULT_SCHED_TICK_SECS);
     // I3/I4：启动即本地 RSS 服务器 —— 关键词搜到新结果就变成 feed 里的新条目（阅读器轮询即见）
     match store::handle(&app) {
         Ok(arc) => {
@@ -862,6 +855,90 @@ fn run_selftest_topics(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+/// 临时验证：窗口在屏内时，navigate 一个长正文页 + 轮询自动入库事件；
+/// 若无入库则 eval 探测页面状态，定位注入链是否在真实页面触发。
+fn run_selftest_crawl(app: tauri::AppHandle) {
+    let url = "https://zh.wikipedia.org/wiki/%E6%81%90%E6%80%96%E7%94%B5%E5%BD%B1";
+    browser::set_query("selftest-crawl");
+    let vis = app.get_webview_window("main").map(|w| w.is_visible().unwrap_or(false));
+    println!("[selftest-crawl] window visible={:?}", vis);
+    match browser::raw_navigate(&app, "main", url) {
+        Ok(m) => println!("[selftest-crawl] navigate -> {}", m),
+        Err(e) => println!("[selftest-crawl] navigate ERR: {}", e),
+    }
+    let t0 = std::time::Instant::now();
+    let mut found: Option<browser::BrowserEvent> = None;
+    while t0.elapsed() < std::time::Duration::from_secs(40) {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for e in browser::list_events().iter().rev() {
+            if (e.kind == "store" || e.kind == "store-skip" || e.kind == "store-error")
+                && e.url.contains("wikipedia.org") {
+                found = Some(e.clone());
+                break;
+            }
+        }
+        if found.is_some() { break; }
+    }
+    match found {
+        Some(e) => println!("[selftest-crawl] ON-SCREEN RENDER OK: kind={} url={} detail={}", e.kind, e.url, e.detail),
+        None => {
+            let probe = browser::eval_string(&app, "main", "(function(){return JSON.stringify({href:location.href,ready:document.readyState,bar:!!document.getElementById('c96-bar'),ex:!!window.__C96_EXTRACT__});})();");
+            println!("[selftest-crawl] NO store in 40s. page probe={:?}", probe);
+            let evs = browser::list_events();
+            for e in evs.iter().rev().take(12) { println!("   ev {} {} {}", e.kind, e.url, e.detail); }
+        }
+    }
+    app.exit(0);
+}
+
+/// 浏览器版调度器：到点的订阅，串行把候选导航进主窗口逐页抽正文入库（能过反爬）。
+fn spawn_crawl_scheduler(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let tick = c96::research::DEFAULT_SCHED_TICK_SECS;
+        loop {
+            if let Ok(arc) = store::handle(&app) {
+                let keys = {
+                    let g = arc.lock().unwrap_or_else(|e| e.into_inner());
+                    c96::research::due_keys(&g, c96::store::doc::now_ms())
+                };
+                for k in keys {
+                    let urls = {
+                        let g = arc.lock().unwrap_or_else(|e| e.into_inner());
+                        c96::research::candidate_urls(&g, &k, &store::run_opts())
+                    };
+                    if let Ok(u) = urls {
+                        if u.is_empty() { continue; }
+                        let rep = browser::crawl(&app, &u, &k);
+                        let mut g = arc.lock().unwrap_or_else(|e| e.into_inner());
+                        c96::research::finalize_crawl(&mut g, &k, rep.stored, c96::store::doc::now_ms());
+                        println!("[c96 crawl] \"{}\": {} 页 · 入库 {} · 跳过 {} · 失败 {}",
+                            k, u.len(), rep.stored, rep.skipped, rep.failed);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(tick));
+        }
+    });
+}
+
+/// 在参数里找 `--query <值>`；值含空格时会被拆成多个 token，这里把到下一个 `--flag`
+/// 之前的所有 token 用空格拼回完整值。
+fn arg_after(args: &[String], key: &str) -> Option<String> {
+    for i in 0..args.len() {
+        if args[i] == key {
+            let mut parts: Vec<String> = Vec::new();
+            let mut j = i + 1;
+            while j < args.len() && !args[j].starts_with("--") {
+                parts.push(args[j].clone());
+                j += 1;
+            }
+            if parts.is_empty() { return None; }
+            return Some(parts.join(" "));
+        }
+    }
+    return None;
+}
+
 fn main() {
     let selftest = std::env::args().any(|a| a == "--selftest");
     let selftest_topics = std::env::args().any(|a| a == "--selftest-topics");
@@ -869,16 +946,36 @@ fn main() {
     let selftest_links = std::env::args().any(|a| a == "--selftest-links");
     let selftest_rss_ui = std::env::args().any(|a| a == "--selftest-rss-ui");
     let selftest_extract = std::env::args().any(|a| a == "--selftest-extract");
+    let selftest_crawl = std::env::args().any(|a| a == "--selftest-crawl");
     // 静默模式（C96 gui --silent）：主窗口创建即隐藏，后台 RSS / 调度照常跑；
     // 自检需要窗口交互，强制可见。
     let silent = std::env::args().any(|a| a == "--silent" || a == "--hidden");
     let any_selftest = selftest || selftest_topics || selftest_rag
         || selftest_links || selftest_rss_ui || selftest_extract;
-    let visible = any_selftest || !silent;
+    // 有 --query（要浏览器爬取）时窗口必须可见才能渲染；静默爬取用小窗。
+    let start_query: Option<String> = {
+        let a: Vec<String> = std::env::args().collect();
+        arg_after(&a, "--query")
+    };
+    let visible = any_selftest || !silent || start_query.is_some();
+    let small = silent && visible;
     tauri::Builder::default()
         // 单实例：再次 `C96 gui` 不再开新进程，而是转发参数给已在跑的实例。
         // 非静默调用 → 唤起已有窗口；带 --silent 的调用（AI 后台调取）→ 不唤窗。
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // --query 转发：让已在跑的实例用浏览器逐页爬这个订阅（小窗，不抢焦点）。
+            if let Some(q) = arg_after(&args, "--query") {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.unminimize();
+                    let _ = w.show();
+                }
+                let a = app.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    let _ = store::crawl_topic(&a, &q);
+                });
+                return;
+            }
             if args.iter().any(|a| a == "--silent" || a == "--hidden") {
                 return;
             }
@@ -915,11 +1012,28 @@ fn main() {
         .setup(move |app| {
             let handle = app.handle().clone();
             // 默认（含 --selftest）：主窗口 = 对外浏览器，先 about:blank，装好接收器再导航。
-            if let Err(e) = browser::open_main(&handle, "about:blank", visible) {
+            if let Err(e) = browser::open_main(&handle, "about:blank", visible, small) {
                 println!("[c96] open_main ERR: {}", e);
             }
             let boot = handle.clone();
             std::thread::spawn(move || boot_main(boot));
+            // 启动自带 --query：窗口就绪后自动用浏览器逐页爬这个订阅。
+            if let Some(q) = start_query.clone() {
+                let h = handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1400));
+                    if let Ok(p) = std::env::var("C96_CRAWL_LOG") {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                            let _ = writeln!(f, "[setup] start_query parsed: {}", q);
+                        }
+                    }
+                    match store::crawl_topic(&h, &q) {
+                        Ok(m) => println!("[c96 crawl] {}", m),
+                        Err(e) => println!("[c96 crawl] ERR: {}", e),
+                    }
+                });
+            }
             if selftest {
                 let h = handle.clone();
                 std::thread::spawn(move || run_selftest(h));
@@ -943,6 +1057,10 @@ fn main() {
             if selftest_rss_ui {
                 let h = handle.clone();
                 std::thread::spawn(move || run_selftest_rss_ui(h));
+            }
+            if selftest_crawl {
+                let h = handle.clone();
+                std::thread::spawn(move || run_selftest_crawl(h));
             }
             Ok(())
         })

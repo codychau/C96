@@ -24,7 +24,7 @@ tauri-plugin-single-instance = "2"
 # 仅 Windows；版本与 Tauri 2.12 的 webview2-com ^0.39 / windows ^0.62 对齐。
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_WindowsAndMessaging"] }
 # #[implement] 宏生成的代码直接引用 windows_core::，需要显式链接（与 windows 0.62 同版本）
 windows-core = "0.62"
 

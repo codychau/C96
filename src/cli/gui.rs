@@ -60,13 +60,26 @@ fn gui_dir(gui: &Path, cwd: &Path) -> PathBuf {
     };
 }
 
+/// 组装传给 GUI 的命令行参数串（静默 + 可选 --query）。
+fn build_params(silent: bool, query: &str) -> String {
+    let mut s = String::new();
+    if silent { s.push_str("--silent"); }
+    if !query.is_empty() {
+        if !s.is_empty() { s.push(' '); }
+        s.push_str("--query \"");
+        s.push_str(query);
+        s.push('"');
+    }
+    return s;
+}
+
 /// Windows：走 shell（ShellExecuteW）启动。
 ///
 /// 用 `std::process::Command` 会让 GUI 子进程继承父进程的 stdout 管道（Rust 在 Windows
 /// 上创建进程时 inherit_handles=TRUE），于是 `C96 gui | more` 这类带管道的调用会一直挂住
 /// 直到 GUI 退出。ShellExecuteW 由 shell 创建进程，不继承调用方的句柄。
 #[cfg(windows)]
-fn spawn(gui: &Path, cwd: &Path, silent: bool) -> Result<PathBuf, String> {
+fn spawn(gui: &Path, cwd: &Path, silent: bool, query: &str) -> Result<PathBuf, String> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
 
@@ -79,9 +92,10 @@ fn spawn(gui: &Path, cwd: &Path, silent: bool) -> Result<PathBuf, String> {
     let file = wide(gui.as_os_str());
     let op = wide(OsStr::new("open"));
     let dir = wide(gui_dir(gui, cwd).as_os_str());
-    // 静默：给 GUI 传 --silent，让它以隐藏窗口方式启动（已运行则不唤窗）。
-    let params = wide(OsStr::new("--silent"));
-    let params_ptr: *const u16 = if silent { params.as_ptr() } else { core::ptr::null() };
+    // 静默传 --silent（小窗）；有 --query 则让 GUI 用浏览器逐页爬这个订阅。
+    let params_str = build_params(silent, query);
+    let params_w = wide(OsStr::new(&params_str));
+    let params_ptr: *const u16 = if params_str.is_empty() { core::ptr::null() } else { params_w.as_ptr() };
     let rc = unsafe {
         ShellExecuteW(
             core::ptr::null_mut(),
@@ -101,7 +115,7 @@ fn spawn(gui: &Path, cwd: &Path, silent: bool) -> Result<PathBuf, String> {
 
 /// 非 Windows：普通分离进程。
 #[cfg(not(windows))]
-fn spawn(gui: &Path, cwd: &Path, silent: bool) -> Result<PathBuf, String> {
+fn spawn(gui: &Path, cwd: &Path, silent: bool, query: &str) -> Result<PathBuf, String> {
     let mut cmd = std::process::Command::new(gui);
     cmd.current_dir(gui_dir(gui, cwd))
         .stdin(std::process::Stdio::null())
@@ -110,6 +124,9 @@ fn spawn(gui: &Path, cwd: &Path, silent: bool) -> Result<PathBuf, String> {
     if silent {
         cmd.arg("--silent");
     }
+    if !query.is_empty() {
+        cmd.arg("--query").arg(query);
+    }
     cmd.spawn()
         .map_err(|e| format!("spawn {} failed: {}", gui.display(), e))?;
     return Ok(gui.to_path_buf());
@@ -117,11 +134,12 @@ fn spawn(gui: &Path, cwd: &Path, silent: bool) -> Result<PathBuf, String> {
 
 /// 拉起 GUI 进程（分离启动，立即返回）。
 ///
-/// `silent=true`（`C96 gui --silent`）：透传 `--silent` 给 GUI —— 未启动则以隐藏
-/// 窗口方式启动；已启动则不唤起其窗口（由 GUI 的单实例逻辑处理）。
+/// `silent=true`（`C96 gui --silent`）：透传 `--silent`；纯静默启动窗口隐藏（不爬时），
+/// 带 `query` 的静默爬取则用小窗（窗口在屏内可见才能渲染，不抢焦点）。
+/// `query` 非空时透传 `--query`，让 GUI 用浏览器逐页爬这个订阅。
 ///
 /// 可用环境变量 `C96_GUI` 显式指定 GUI 可执行文件路径。
-pub fn launch(silent: bool) -> Result<PathBuf, String> {
+pub fn launch(silent: bool, query: &str) -> Result<PathBuf, String> {
     let exe_dir: PathBuf = match std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
         Some(d) => d,
         None => return Err("cannot resolve CLI executable directory".to_string()),
@@ -130,11 +148,11 @@ pub fn launch(silent: bool) -> Result<PathBuf, String> {
     if let Ok(env_path) = std::env::var("C96_GUI") {
         let p = PathBuf::from(env_path);
         if p.is_file() {
-            return spawn(&p, &cwd, silent);
+            return spawn(&p, &cwd, silent, query);
         }
     }
     match find_gui(&exe_dir, &cwd) {
-        Some(p) => return spawn(&p, &cwd, silent),
+        Some(p) => return spawn(&p, &cwd, silent, query),
         None => {
             let tried: Vec<String> = candidates(&exe_dir, &cwd).iter().map(|p| p.display().to_string()).collect();
             return Err(format!(

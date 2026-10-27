@@ -12,6 +12,8 @@ use c96::store::kb;
 use tauri::AppHandle;
 use tauri::Manager;
 
+use crate::browser;
+
 pub use c96::research::ServeResult;
 pub use c96::research::TopicRun;
 pub use c96::store::doc::KbDoc;
@@ -50,6 +52,30 @@ pub fn run_opts() -> research::RunOpts {
     o.net.timeout_s = 20;
     o.net.retries = 1;
     return o;
+}
+
+/// 用浏览器逐页爬取一个已存在的订阅任务：搜候选 → 串行导航进窗口抽正文入库 → 更新任务。
+pub fn crawl_topic(app: &AppHandle, query: &str) -> Result<String, String> {
+    let arc = handle(app)?;
+    let urls = {
+        let g = arc.lock().unwrap_or_else(|e| e.into_inner());
+        research::candidate_urls(&g, query, &run_opts())?
+    };
+    if urls.is_empty() { return Ok("没有候选可爬".to_string()); }
+    let rep = browser::crawl(app, &urls, query);
+    {
+        let mut g = arc.lock().unwrap_or_else(|e| e.into_inner());
+        research::finalize_crawl(&mut g, query, rep.stored, c96::store::doc::now_ms());
+    }
+    let msg = format!("浏览器爬取 {} 页 · 入库 {} · 跳过 {} · 失败 {}",
+        urls.len(), rep.stored, rep.skipped, rep.failed);
+    if let Ok(p) = std::env::var("C96_CRAWL_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+            let _ = writeln!(f, "[crawl_topic] {} => {} (urls={})", query, msg, urls.len());
+        }
+    }
+    return Ok(msg);
 }
 
 // ------------------------------------------------------------------ F ----
@@ -120,11 +146,40 @@ pub fn topic_list(app: &AppHandle) -> Result<Vec<Topic>, String> {
     return with(app, |s| s.state().topics.clone());
 }
 
-/// 立即刷新一个主题（任务清单里的"跑一次"）。
+/// 立即刷新一个主题：用浏览器逐页爬（过反爬），返回与旧刷新兼容的 TopicRun。
 pub fn topic_run(app: &AppHandle, query: &str) -> Result<TopicRun, String> {
     let arc = handle(app)?;
-    let mut g = arc.lock().unwrap_or_else(|e| e.into_inner());
-    return research::refresh(&mut g, query, &run_opts(), c96::store::doc::now_ms());
+    let urls = {
+        let g = arc.lock().unwrap_or_else(|e| e.into_inner());
+        research::candidate_urls(&g, query, &run_opts())?
+    };
+    let started = c96::store::doc::now_ms();
+    let rep = if urls.is_empty() {
+        browser::CrawlReport { stored: 0, skipped: 0, failed: 0 }
+    } else {
+        browser::crawl(app, &urls, query)
+    };
+    {
+        let mut g = arc.lock().unwrap_or_else(|e| e.into_inner());
+        research::finalize_crawl(&mut g, query, rep.stored, c96::store::doc::now_ms());
+    }
+    let end = c96::store::doc::now_ms();
+    let r = research::TopicRun {
+        query: query.to_string(),
+        key: c96::store::state::topic_key(query),
+        candidates: urls.len(),
+        unique: urls.len(),
+        fetched: urls.len(),
+        stored: rep.stored as usize,
+        skipped: rep.skipped as usize,
+        unchanged: 0,
+        failed: rep.failed as usize,
+        ms: end.saturating_sub(started),
+        status: "ok".to_string(),
+        error: String::new(),
+        reports: Vec::new(),
+    };
+    return Ok(r);
 }
 
 pub fn topic_remove(app: &AppHandle, query: &str) -> Result<bool, String> {
@@ -165,6 +220,29 @@ pub fn set_rss_base(local: &str, lan: &str, token: &str) {
 
 pub fn rss_base() -> RssBase {
     return RSS_BASE.get().cloned().unwrap_or_else(|| ("".to_string(), "".to_string(), "".to_string()));
+}
+
+fn ui_lang_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    return Ok(dir.join("ui-lang.txt"));
+}
+
+/// UI 语言：`zh`（默认）/ `en`，落在 app_data_dir，跨站点共享。
+pub fn ui_lang(app: &AppHandle) -> String {
+    if let Ok(p) = ui_lang_path(app) {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            return if s.trim() == "en" { "en".to_string() } else { "zh".to_string() };
+        }
+    }
+    return "zh".to_string();
+}
+
+pub fn set_ui_lang(app: &AppHandle, lang: &str) -> Result<String, String> {
+    let l = if lang == "en" { "en" } else { "zh" };
+    let p = ui_lang_path(app)?;
+    std::fs::write(p, l).map_err(|e| e.to_string())?;
+    return Ok(l.to_string());
 }
 
 /// 「改」：改间隔 / 暂停恢复，并重算 next_due。
@@ -332,6 +410,8 @@ pub fn rss_op(app: &AppHandle, op: &str, args: &serde_json::Value) -> Result<ser
     let uarg = |k: &str| args.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let barg = |k: &str| args.get(k).and_then(|v| v.as_bool());
     match op {
+        "lang_get" => { return Ok(serde_json::json!(ui_lang(app))); }
+        "lang_set" => { return Ok(serde_json::json!(set_ui_lang(app, &sarg("lang"))?)); }
         "base" => { return serde_json::to_value(rss_base()).map_err(|e| e.to_string()); }
         "topics" => { return serde_json::to_value(topic_list(app)?).map_err(|e| e.to_string()); }
         "sources" => { return serde_json::to_value(sources(app)?).map_err(|e| e.to_string()); }

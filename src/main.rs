@@ -40,6 +40,7 @@ fn usage() {
     println!("  search --query Q [options]        Bing/Baidu SERP → normalized candidates (D)");
     println!("  store stats|list|search|purge|add|state    RAG knowledge base (JSONL, F)");
     println!("  research --query Q [--watch]      topic subscription: search→RAG→refresh (I)");
+    println!("  research --query Q 默认交给 GUI 用浏览器逐页爬正文(过反爬); --headless 走 ureq; --silent 小窗; 浏览器始终静音");
     println!("  topics list|show|run|pause|resume|rm|due   persistent topic task list (I)");
     println!("  index stats|query|bench            BM25 index: char-code terms + weights (G)");
     println!("  rss serve|urls|opml                local RSS server: topics -> feeds (I3/I4)");
@@ -112,7 +113,7 @@ fn main() {
     }
     if cmd == "" && !parsed.has_flag("help") && !parsed.has_flag("h") {
         // 双击（无参数）：优先拉起 GUI 进程；GUI 未构建时回退到 usage。
-        match cli::gui::launch(false) {
+        match cli::gui::launch(false, "") {
             Ok(p) => {
                 println!("C96 GUI 已启动：{}", p.display());
                 std::process::exit(0);
@@ -126,7 +127,7 @@ fn main() {
     }
     if cmd == "gui" {
         let silent = parsed.has_flag("silent") || parsed.has_flag("hidden");
-        match cli::gui::launch(silent) {
+        match cli::gui::launch(silent, "") {
             Ok(p) => {
                 if silent {
                     println!("C96 GUI 静默启动：{}（窗口隐藏；若已在运行则不唤窗）", p.display());

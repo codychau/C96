@@ -1,4 +1,4 @@
-//! E1/E2：自控窗口（self-controlled browsing surface）。
+﻿//! E1/E2：自控窗口（self-controlled browsing surface）。
 //!
 //! Tauri v2 在 Windows 上默认 WebView2。本模块负责：
 //!   1. 打开 label=browser 的第二个 WebView2 窗口，加载用户给出的 URL
@@ -24,6 +24,11 @@ use tauri::Manager;
 use tauri::WebviewUrl;
 use tauri::WebviewWindow;
 use tauri::WebviewWindowBuilder;
+
+/// 所有 WebView2 窗口统一的 Chromium 参数：保留 wry 默认项，并永久静音，
+/// 避免网页自动播放音乐/视频产生噪声（`--mute-audio`）。
+const BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --mute-audio";
 
 /// 事件记录（E2）：点击 / 跳转 / 加载 / SPA / 页面主动上报。
 #[derive(Clone, serde::Serialize)]
@@ -471,6 +476,158 @@ pub const LINKS_INIT: &str = r##"(function () {
 pub const OVERLAY_INIT: &str = r##"(function () {
   if (window.__C96_BAR__) { return; }
   window.__C96_BAR__ = true;
+  var UI_LANG = "zh";
+  try { var _cached = localStorage.getItem("c96.uiLang"); if (_cached === "en") { UI_LANG = "en"; } } catch (e) {}
+  var I18N = {
+    zh: {
+      search_ph: "输入搜索内容或网址，回车（加载后自动存入 RAG 知识库）",
+      ready: "就绪", snap: "收录", snap_title: "手动收录当前页面的文章信息",
+      settings: "设置", settings_title: "设置", ui_lang: "界面语言",
+      lang_hint: "选择后立即生效，并记住到下次启动。", close: "关闭",
+      rss_title: "RSS 内容管理器（增删改查）", rss_panel_title: "RSS 内容管理器",
+      refresh: "刷新", loading: "加载中…", add_sub: "添加订阅",
+      kw_ph: "关键词：新订阅会立刻搜索并入 RAG", interval_title: "刷新间隔（秒）",
+      topics: "关键词订阅 ", sources: "来源分组 ", all_content: "全部内容 ",
+      filter_ph: "过滤 标题/网址/主机/来源", only_manual: "只看随手收录", show_all: "显示全部",
+      hosts: "主机制 ", blocklist: "URL 黑名单 ",
+      block_ph: "加入黑名单：*.tracker.net 或 *://news.example.com/*（支持 *）", block_add: "加入黑名单",
+      del: "删", confirm: "确认?", delete: "删除", confirm_delete: "确认删除?",
+      items: "条目", save_interval: "改间隔", pause: "暂停", resume: "恢复",
+      clear: "清空", confirm_clear: "确认清空?", copy: "复制", copy_url: "复制地址",
+      ignore: "忽略", unignore: "取消忽略", builtin: "内置"
+    },
+    en: {
+      search_ph: "Search or enter a URL, press Enter (auto-saved to RAG after load)",
+      ready: "Ready", snap: "Capture", snap_title: "Manually save this page's article",
+      settings: "Settings", settings_title: "Settings", ui_lang: "UI language",
+      lang_hint: "Applied immediately and remembered for next launch.", close: "Close",
+      rss_title: "RSS content manager (CRUD)", rss_panel_title: "RSS Content Manager",
+      refresh: "Refresh", loading: "Loading…", add_sub: "Add",
+      kw_ph: "Keyword: new subscription searches and saves to RAG immediately", interval_title: "Refresh interval (seconds)",
+      topics: "Keyword subscriptions ", sources: "Source groups ", all_content: "All content ",
+      filter_ph: "Filter title/URL/host/source", only_manual: "Manual only", show_all: "Show all",
+      hosts: "Hosts ", blocklist: "URL blocklist ",
+      block_ph: "Add block rule: *.tracker.net or *://news.example.com/* (supports *)", block_add: "Block",
+      del: "Del", confirm: "Confirm?", delete: "Delete", confirm_delete: "Confirm delete?",
+      items: "Items", save_interval: "Save", pause: "Pause", resume: "Resume",
+      clear: "Clear", confirm_clear: "Confirm clear?", copy: "Copy", copy_url: "Copy URL",
+      ignore: "Ignore", unignore: "Unignore", builtin: "Built-in"
+    }
+  };
+  function L(k) {
+    var d = I18N[UI_LANG] || I18N.zh;
+    if (d[k] !== undefined) { return d[k]; }
+    return I18N.zh[k] !== undefined ? I18N.zh[k] : k;
+  }
+  function applyLang() {
+    var q = document.getElementById("c96-q");
+    if (q) { q.placeholder = L("search_ph"); }
+    var st = document.getElementById("c96-status");
+    if (st && st.getAttribute("data-l10n") === "ready") { st.textContent = L("ready"); }
+    var snap = document.getElementById("c96-snap-btn");
+    if (snap) {
+      snap.title = L("snap_title");
+      var sl = snap.querySelector(".c96-btn-label");
+      if (sl) { sl.textContent = L("snap"); }
+    }
+    var rss = document.getElementById("c96-rss-btn");
+    if (rss) { rss.title = L("rss_title"); }
+    var setb = document.getElementById("c96-settings-btn");
+    if (setb) {
+      setb.title = L("settings_title");
+      var pl = setb.querySelector(".c96-btn-label");
+      if (pl) { pl.textContent = L("settings"); }
+    }
+    var d = document.getElementById("c96-settings");
+    if (d) {
+      var ht = d.querySelector(".c96-set-title"); if (ht) { ht.textContent = L("settings_title"); }
+      var lb = d.querySelector(".c96-set-label"); if (lb) { lb.textContent = L("ui_lang"); }
+      var hn = d.querySelector(".c96-set-hint"); if (hn) { hn.textContent = L("lang_hint"); }
+      var cl = d.querySelector(".c96-set-close"); if (cl) { cl.textContent = L("close"); }
+    }
+    var p = document.getElementById("c96-rss-panel");
+    if (p && p.parentNode) { p.parentNode.removeChild(p); }
+  }
+  function setLang(l) {
+    UI_LANG = (l === "en") ? "en" : "zh";
+    try { localStorage.setItem("c96.uiLang", UI_LANG); } catch (e) {}
+    applyLang();
+  }
+  function syncLang() {
+    try {
+      ipc("lang_get", {}).then(function (v) {
+        if ((v === "en" || v === "zh") && v !== UI_LANG) {
+          UI_LANG = v;
+          try { localStorage.setItem("c96.uiLang", v); } catch (e) {}
+          applyLang();
+        }
+      }).catch(function () {});
+    } catch (e) {}
+  }
+  function mkBarBtn(id, title, color, svg, label) {
+    var b = document.createElement("button");
+    b.id = id;
+    b.type = "button";
+    b.title = title;
+    b.setAttribute("style", "display:flex;align-items:center;gap:4px;height:30px;padding:0 8px;background:#1c2027;color:" + color + ";border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
+    b.innerHTML = svg;
+    var s = document.createElement("span");
+    s.className = "c96-btn-label";
+    s.textContent = label;
+    b.appendChild(s);
+    return b;
+  }
+  function openSettings() {
+    var d = document.getElementById("c96-settings");
+    if (!d) {
+      d = document.createElement("div");
+      d.id = "c96-settings";
+      d.setAttribute("style", "display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;background:rgba(0,0,0,.55);align-items:center;justify-content:center;font:13px/1.5 system-ui,'Segoe UI',sans-serif;");
+      var card = document.createElement("div");
+      card.setAttribute("style", "width:360px;max-width:92vw;background:#14161a;color:#e6e6e6;border:1px solid #2a2e36;border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,.6);padding:16px;");
+      var h = document.createElement("div");
+      h.className = "c96-set-title";
+      h.textContent = L("settings_title");
+      h.setAttribute("style", "color:#f59e0b;font-weight:700;margin-bottom:12px;");
+      var lb = document.createElement("div");
+      lb.className = "c96-set-label";
+      lb.textContent = L("ui_lang");
+      lb.setAttribute("style", "color:#9aa4b2;margin-bottom:6px;");
+      var sel = document.createElement("select");
+      sel.id = "c96-lang-sel";
+      sel.setAttribute("style", "width:100%;height:32px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 8px;font:13px system-ui;");
+      var zh = document.createElement("option");
+      zh.value = "zh"; zh.textContent = "中文（简体）";
+      var en = document.createElement("option");
+      en.value = "en"; en.textContent = "English";
+      sel.appendChild(zh); sel.appendChild(en);
+      sel.value = UI_LANG;
+      sel.addEventListener("change", function () {
+        setLang(sel.value);
+        try { ipc("lang_set", { lang: sel.value }).catch(function () {}); } catch (e) {}
+      });
+      var hint = document.createElement("div");
+      hint.className = "c96-set-hint";
+      hint.textContent = L("lang_hint");
+      hint.setAttribute("style", "color:#6b7280;font-size:12px;margin-top:8px;");
+      var foot = document.createElement("div");
+      foot.setAttribute("style", "display:flex;justify-content:flex-end;margin-top:14px;");
+      var close = document.createElement("button");
+      close.type = "button";
+      close.className = "c96-set-close";
+      close.textContent = L("close");
+      close.setAttribute("style", "height:30px;padding:0 14px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
+      close.addEventListener("click", function () { d.style.display = "none"; });
+      d.addEventListener("click", function (ev) { if (ev.target === d) { d.style.display = "none"; } });
+      foot.appendChild(close);
+      card.appendChild(h); card.appendChild(lb); card.appendChild(sel); card.appendChild(hint); card.appendChild(foot);
+      d.appendChild(card);
+      (document.body || document.documentElement).appendChild(d);
+    }
+    d.style.display = "flex";
+    var cur = document.getElementById("c96-lang-sel");
+    if (cur) { cur.value = UI_LANG; }
+  }
   function post(type, detail, extra) {
     var payload = { type: type, url: location.href, detail: detail };
     if (extra) { for (var k in extra) { if (extra.hasOwnProperty(k)) { payload[k] = extra[k]; } } }
@@ -498,11 +655,12 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     var input = document.createElement("input");
     input.id = "c96-q";
     input.type = "text";
-    input.placeholder = "输入搜索内容或网址，回车（加载后自动存入 RAG 知识库）";
+    input.placeholder = L("search_ph");
     input.setAttribute("style", "flex:1;height:32px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 10px;font:inherit;outline:none;");
     var status = document.createElement("span");
     status.id = "c96-status";
-    status.textContent = "就绪";
+    status.textContent = L("ready");
+    status.setAttribute("data-l10n", "ready");
     status.setAttribute("style", "color:#9aa4b2;font-size:12px;max-width:260px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
     input.addEventListener("keydown", function (e) {
       if (e.key !== "Enter") { return; }
@@ -519,22 +677,36 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     bar.appendChild(label);
     bar.appendChild(input);
     bar.appendChild(status);
+    // 收录：手动收录当前页面文章（复用自动采集的抽取 + 入库链路）
+    var snapBtn = mkBarBtn("c96-snap-btn", L("snap_title"), "#93c5fd",
+      '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#93c5fd" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>',
+      L("snap"));
+    snapBtn.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      capture();
+    });
+    bar.appendChild(snapBtn);
     // RSS 内容管理器：顶部工具栏图标 -> 弹层（增删改查）
-    var rssBtn = document.createElement("button");
-    rssBtn.id = "c96-rss-btn";
-    rssBtn.type = "button";
-    rssBtn.title = "RSS 内容管理器（增删改查）";
-    rssBtn.setAttribute("style", "display:flex;align-items:center;gap:4px;height:30px;padding:0 8px;background:#1c2027;color:#f59e0b;border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
-    rssBtn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2.4" stroke-linecap="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1.5" fill="#f59e0b" stroke="none"/></svg>';
-    var rssLabel = document.createElement("span");
-    rssLabel.textContent = "RSS";
-    rssBtn.appendChild(rssLabel);
+    var rssBtn = mkBarBtn("c96-rss-btn", L("rss_title"), "#f59e0b",
+      '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2.4" stroke-linecap="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1.5" fill="#f59e0b" stroke="none"/></svg>',
+      "RSS");
     rssBtn.addEventListener("click", function (e) {
       e.preventDefault();
       e.stopPropagation();
       toggleRssPanel();
     });
     bar.appendChild(rssBtn);
+    // 设置：UI 语言（中文 / English），选择后立即生效并持久化
+    var setBtn = mkBarBtn("c96-settings-btn", L("settings_title"), "#93c5fd",
+      '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#93c5fd" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+      L("settings"));
+    setBtn.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      openSettings();
+    });
+    bar.appendChild(setBtn);
     var root = document.body || document.documentElement;
     root.appendChild(bar);
     try {
@@ -678,13 +850,13 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     var head = document.createElement("div");
     head.setAttribute("style", "display:flex;align-items:center;gap:8px;margin-bottom:8px;");
     var title = document.createElement("b");
-    title.textContent = "RSS 内容管理器";
+    title.textContent = L("rss_panel_title");
     title.setAttribute("style", "color:#f59e0b;");
     var st = document.createElement("span");
     st.id = "c96-rss-status";
-    st.textContent = "就绪";
+    st.textContent = L("ready");
     st.setAttribute("style", "flex:1;color:#9aa4b2;font-size:12px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
-    var reload = rssBtnNew("刷新", "c96-rss-reload");
+    var reload = rssBtnNew(L("refresh"), "c96-rss-reload");
     var close = rssBtnNew("×", "c96-rss-close", "#f87171");
     close.addEventListener("click", function () { p.style.display = "none"; });
     reload.addEventListener("click", function () { reloadRss(); });
@@ -695,19 +867,19 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     var urls = document.createElement("div");
     urls.id = "c96-rss-urls";
     urls.setAttribute("style", "background:#1a1d23;border:1px solid #2a2e36;border-radius:8px;padding:8px;font-size:12px;color:#9aa4b2;");
-    urls.textContent = "订阅地址加载中…";
+    urls.textContent = L("loading");
     var addBox = document.createElement("div");
     addBox.setAttribute("style", "display:flex;gap:6px;margin:8px 0;");
     var q = document.createElement("input");
     q.id = "c96-rss-new-q";
-    q.placeholder = "关键词：新订阅会立刻搜索并入 RAG";
+    q.placeholder = L("kw_ph");
     q.setAttribute("style", "flex:1;height:28px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 8px;font:12px system-ui;");
     var iv = document.createElement("input");
     iv.id = "c96-rss-new-int";
     iv.value = "300";
-    iv.title = "刷新间隔（秒）";
+    iv.title = L("interval_title");
     iv.setAttribute("style", "width:64px;height:28px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 6px;font:12px system-ui;");
-    var add = rssBtnNew("添加订阅", "c96-rss-add", "#93c5fd");
+    var add = rssBtnNew(L("add_sub"), "c96-rss-add", "#93c5fd");
     add.addEventListener("click", function () {
       var text = (q.value || "").trim();
       if (!text) { rssStatus("请输入关键词"); return; }
@@ -728,28 +900,28 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     addBox.appendChild(add);
     var tTitle = document.createElement("div");
     tTitle.setAttribute("style", "color:#93c5fd;margin:10px 0 4px;");
-    tTitle.textContent = "关键词订阅 ";
+    tTitle.textContent = L("topics");
     var tCount = document.createElement("span");
     tCount.id = "c96-rss-tcount";
     tCount.setAttribute("style", "color:#9aa4b2;font-size:12px;");
     tTitle.appendChild(tCount);
     var tList = document.createElement("div");
     tList.id = "c96-rss-topics";
-    tList.textContent = "加载中…";
+    tList.textContent = L("loading");
     var sTitle = document.createElement("div");
     sTitle.setAttribute("style", "color:#93c5fd;margin:12px 0 4px;");
-    sTitle.textContent = "来源分组 ";
+    sTitle.textContent = L("sources");
     var sCount = document.createElement("span");
     sCount.id = "c96-rss-scount";
     sCount.setAttribute("style", "color:#9aa4b2;font-size:12px;");
     sTitle.appendChild(sCount);
     var sList = document.createElement("div");
     sList.id = "c96-rss-sources";
-    sList.textContent = "加载中…";
+    sList.textContent = L("loading");
     // 全部内容：过滤 + 只看随手收录 + 逐条删
     var dTitle = document.createElement("div");
     dTitle.setAttribute("style", "color:#93c5fd;margin:12px 0 4px;");
-    dTitle.textContent = "全部内容 ";
+    dTitle.textContent = L("all_content");
     var dCount = document.createElement("span");
     dCount.id = "c96-rss-dcount";
     dCount.setAttribute("style", "color:#9aa4b2;font-size:12px;");
@@ -758,40 +930,40 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     dCtl.setAttribute("style", "display:flex;gap:6px;margin:2px 0 4px;");
     var dq = document.createElement("input");
     dq.id = "c96-rss-dq";
-    dq.placeholder = "过滤 标题/网址/主机/来源";
+    dq.placeholder = L("filter_ph");
     dq.setAttribute("style", "flex:1;height:26px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 8px;font:12px system-ui;");
     dq.addEventListener("input", function () {
       if (RSS_DQ_TIMER) { clearTimeout(RSS_DQ_TIMER); }
       RSS_DQ_TIMER = setTimeout(function () { RSS_DQ_TIMER = 0; reloadDocs(); }, 250);
     });
-    var dunsub = rssBtnNew("只看随手收录", "c96-rss-dunsub", "#fbbf24");
+    var dunsub = rssBtnNew(L("only_manual"), "c96-rss-dunsub", "#fbbf24");
     dunsub.setAttribute("data-on", "0");
     dunsub.addEventListener("click", function () {
       var on = this.getAttribute("data-on") === "1";
       this.setAttribute("data-on", on ? "0" : "1");
-      this.textContent = on ? "只看随手收录" : "显示全部";
+      this.textContent = on ? L("only_manual") : L("show_all");
       reloadDocs();
     });
     dCtl.appendChild(dq);
     dCtl.appendChild(dunsub);
     var dList = document.createElement("div");
     dList.id = "c96-rss-docs";
-    dList.textContent = "加载中…";
+    dList.textContent = L("loading");
     // 主机制：按站点清空 / 忽略（忽略后不再自动收录）
     var hTitle = document.createElement("div");
     hTitle.setAttribute("style", "color:#93c5fd;margin:12px 0 4px;");
-    hTitle.textContent = "主机制 ";
+    hTitle.textContent = L("hosts");
     var hCount = document.createElement("span");
     hCount.id = "c96-rss-hcount";
     hCount.setAttribute("style", "color:#9aa4b2;font-size:12px;");
     hTitle.appendChild(hCount);
     var hList = document.createElement("div");
     hList.id = "c96-rss-hosts";
-    hList.textContent = "加载中…";
+    hList.textContent = L("loading");
     // 黑名单：内置搜索引擎结果页规则 + 用户自加 glob（含此 URL 的页面不再自动收录）
     var bTitle = document.createElement("div");
     bTitle.setAttribute("style", "color:#93c5fd;margin:12px 0 4px;");
-    bTitle.textContent = "URL 黑名单 ";
+    bTitle.textContent = L("blocklist");
     var bCount = document.createElement("span");
     bCount.id = "c96-rss-bcount";
     bCount.setAttribute("style", "color:#9aa4b2;font-size:12px;");
@@ -800,9 +972,9 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     bAddBox.setAttribute("style", "display:flex;gap:6px;margin:2px 0 4px;");
     var bp = document.createElement("input");
     bp.id = "c96-rss-bpat";
-    bp.placeholder = "加入黑名单：*.tracker.net 或 *://news.example.com/*（支持 *）";
+    bp.placeholder = L("block_ph");
     bp.setAttribute("style", "flex:1;height:26px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 8px;font:12px system-ui;");
-    var badd = rssBtnNew("加入黑名单", "c96-rss-badd", "#93c5fd");
+    var badd = rssBtnNew(L("block_add"), "c96-rss-badd", "#93c5fd");
     badd.addEventListener("click", function () {
       var raw = (bp.value || "").trim();
       if (!raw) { rssStatus("请输入黑名单规则"); return; }
@@ -816,7 +988,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     bAddBox.appendChild(badd);
     var bList = document.createElement("div");
     bList.id = "c96-rss-block";
-    bList.textContent = "加载中…";
+    bList.textContent = L("loading");
     p.appendChild(head);
     p.appendChild(urls);
     p.appendChild(addBox);
@@ -848,12 +1020,12 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     var host = document.createElement("span");
     host.textContent = r[3] || "";
     host.setAttribute("style", "color:#6b7280;");
-    var del = rssBtnNew("删", null, "#f87171");
+    var del = rssBtnNew(L("del"), null, "#f87171");
     del.addEventListener("click", function (ev) {
       var b = ev.currentTarget;
       if (b.getAttribute("data-armed") !== "1") {
         b.setAttribute("data-armed", "1");
-        b.textContent = "确认?";
+        b.textContent = L("confirm");
         return;
       }
       ipc("rss_doc_remove", { hash: r[0] }).then(function (ok) {
@@ -887,7 +1059,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     head.appendChild(meta);
     var ops = document.createElement("div");
     ops.setAttribute("style", "display:flex;gap:5px;flex-wrap:wrap;margin-top:5px;align-items:center;");
-    var run = rssBtnNew("刷新", null, "#93c5fd");
+    var run = rssBtnNew(L("refresh"), null, "#93c5fd");
     run.addEventListener("click", function () {
       rssStatus("刷新中：" + t.query + " …");
       ipc("topic_run", { query: t.query }).then(function (r) {
@@ -895,7 +1067,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
         return reloadRss();
       }).catch(function (e) { rssStatus("刷新失败：" + e); });
     });
-    var pause = rssBtnNew(t.paused ? "恢复" : "暂停", null, "#fbbf24");
+    var pause = rssBtnNew(t.paused ? L("resume") : L("pause"), null, "#fbbf24");
     pause.addEventListener("click", function () {
       ipc("topic_update", { query: t.query, interval_secs: 0, intervalSecs: 0, paused: !t.paused }).then(function () {
         rssStatus((t.paused ? "已恢复 " : "已暂停 ") + t.query);
@@ -907,7 +1079,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     int.value = String(t.interval_secs);
     int.title = "刷新间隔（秒）";
     int.setAttribute("style", "width:64px;height:24px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:5px;padding:0 6px;font:12px system-ui;");
-    var save = rssBtnNew("改间隔", "c96-rss-save-" + t.key, "#86efac");
+    var save = rssBtnNew(L("save_interval"), "c96-rss-save-" + t.key, "#86efac");
     save.addEventListener("click", function () {
       var v = parseInt(int.value, 10);
       if (!(v > 0)) { rssStatus("间隔要大于 0 秒"); return; }
@@ -916,24 +1088,24 @@ pub const OVERLAY_INIT: &str = r##"(function () {
         return reloadRss();
       }).catch(function (e) { rssStatus("改间隔失败：" + e); });
     });
-    var docs = rssBtnNew("条目", "c96-rss-docs-" + t.key);
+    var docs = rssBtnNew(L("items"), "c96-rss-docs-" + t.key);
     var box = document.createElement("div");
     box.id = "c96-rss-items-" + t.key;
     box.setAttribute("style", "display:none;margin-top:6px;border-top:1px dashed #2a2e36;padding-top:6px;");
     docs.addEventListener("click", function () {
       if (box.style.display === "none") {
         box.style.display = "block";
-        box.textContent = "加载中…";
+        box.textContent = L("loading");
         ipc("topic_docs", { query: t.query, limit: 20 }).then(function (rows) { renderRssItems(box, rows); })
           .catch(function (e) { box.textContent = "读取失败：" + e; });
       } else { box.style.display = "none"; }
     });
-    var del = rssBtnNew("删除", "c96-rss-del-" + t.key, "#f87171");
+    var del = rssBtnNew(L("delete"), "c96-rss-del-" + t.key, "#f87171");
     del.addEventListener("click", function (ev) {
       var b = ev.currentTarget;
       if (b.getAttribute("data-armed") !== "1") {
         b.setAttribute("data-armed", "1");
-        b.textContent = "确认删除?";
+        b.textContent = L("confirm_delete");
         return;
       }
       ipc("topic_remove", { query: t.query }).then(function (ok) {
@@ -978,16 +1150,16 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       var ct = document.createElement("span");
       ct.textContent = r[1] + " 条 · " + rssTime(r[2]);
       ct.setAttribute("style", "color:#6b7280;");
-      var cp = rssBtnNew("复制地址", null, "#93c5fd");
+      var cp = rssBtnNew(L("copy_url"), null, "#93c5fd");
       cp.addEventListener("click", function (ev) {
         rssCopy(rssUrl(RSS_BASE[0], "/rss/source/" + encodeURIComponent(ev.currentTarget.getAttribute("data-src")) + ".xml", RSS_BASE[2]));
       });
       cp.setAttribute("data-src", r[0]);
-      var sclr = rssBtnNew("清空", null, "#f87171");
+      var sclr = rssBtnNew(L("clear"), null, "#f87171");
       sclr.setAttribute("data-src", r[0]);
       sclr.addEventListener("click", function (ev) {
         var b = ev.currentTarget;
-        if (b.getAttribute("data-armed") !== "1") { b.setAttribute("data-armed", "1"); b.textContent = "确认清空?"; return; }
+        if (b.getAttribute("data-armed") !== "1") { b.setAttribute("data-armed", "1"); b.textContent = L("confirm_clear"); return; }
         var name = b.getAttribute("data-src");
         var raw = (name === "(none)") ? "" : name;
         ipc("source_remove", { source: raw }).then(function (n) {
@@ -1028,10 +1200,10 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     var tag = document.createElement("span");
     if (r[5]) { tag.textContent = "#" + r[5]; tag.setAttribute("style", "color:#86efac;white-space:nowrap;"); }
     else { tag.textContent = r[4] ? r[4] : "随手"; tag.setAttribute("style", "color:#fbbf24;white-space:nowrap;"); }
-    var del = rssBtnNew("删", null, "#f87171");
+    var del = rssBtnNew(L("del"), null, "#f87171");
     del.addEventListener("click", function (ev) {
       var b = ev.currentTarget;
-      if (b.getAttribute("data-armed") !== "1") { b.setAttribute("data-armed", "1"); b.textContent = "确认?"; return; }
+      if (b.getAttribute("data-armed") !== "1") { b.setAttribute("data-armed", "1"); b.textContent = L("confirm"); return; }
       ipc("rss_doc_remove", { hash: r[0] }).then(function (ok) {
         line.style.display = "none";
         rssStatus(ok ? "已删 " + (r[2] || r[0]) : "条目不存在（可能已被 TTL 清掉）");
@@ -1060,7 +1232,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
   function reloadDocs() {
     var el = document.getElementById("c96-rss-docs");
     if (!el) { return Promise.resolve(); }
-    el.textContent = "加载中…";
+    el.textContent = L("loading");
     return ipc("docs", { filter: rssFilter(), only_unsub: rssOnlyUnsub(), limit: 300 })
       .then(function (o) { renderRssDocs(o); })
       .catch(function (e) { el.textContent = "读取失败：" + e; });
@@ -1078,16 +1250,16 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     line.appendChild(nm);
     line.appendChild(ct);
     if (raw) {
-      var clr = rssBtnNew("清空", null, "#f87171");
+      var clr = rssBtnNew(L("clear"), null, "#f87171");
       clr.addEventListener("click", function (ev) {
         var b = ev.currentTarget;
-        if (b.getAttribute("data-armed") !== "1") { b.setAttribute("data-armed", "1"); b.textContent = "确认清空?"; return; }
+        if (b.getAttribute("data-armed") !== "1") { b.setAttribute("data-armed", "1"); b.textContent = L("confirm_clear"); return; }
         ipc("host_remove", { host: raw }).then(function (n) {
           rssStatus("已清空 " + raw + "：删掉 " + n + " 条");
           return refreshLists();
         }).catch(function (e) { rssStatus("清空失败：" + e); });
       });
-      var ig = rssBtnNew(r[4] ? "取消忽略" : "忽略", null, r[4] ? "#86efac" : "#fbbf24");
+      var ig = rssBtnNew(r[4] ? L("unignore") : L("ignore"), null, r[4] ? "#86efac" : "#fbbf24");
       ig.addEventListener("click", function () {
         ipc("ignore", { host: raw, on: !r[4] }).then(function () {
           rssStatus((r[4] ? "已取消忽略 " : "已忽略 ") + raw + (r[4] ? "" : "（以后不再自动收录）"));
@@ -1120,10 +1292,10 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     nm.setAttribute("style", "flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-family:monospace;color:" + (editable ? "#e6e6e6" : "#6b7280") + ";");
     line.appendChild(nm);
     if (editable) {
-      var del = rssBtnNew("删除", null, "#f87171");
+      var del = rssBtnNew(L("delete"), null, "#f87171");
       del.addEventListener("click", function (ev) {
         var b = ev.currentTarget;
-        if (b.getAttribute("data-armed") !== "1") { b.setAttribute("data-armed", "1"); b.textContent = "确认删除?"; return; }
+        if (b.getAttribute("data-armed") !== "1") { b.setAttribute("data-armed", "1"); b.textContent = L("confirm_delete"); return; }
         ipc("pattern_remove", { pattern: pat }).then(function (ok) {
           rssStatus(ok ? "已删除规则：" + pat : "规则不存在（内置规则不可删）");
           return reloadPatterns();
@@ -1132,7 +1304,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       line.appendChild(del);
     } else {
       var tag = document.createElement("span");
-      tag.textContent = "内置";
+      tag.textContent = L("builtin");
       tag.setAttribute("style", "color:#6b7280;white-space:nowrap;");
       line.appendChild(tag);
     }
@@ -1188,7 +1360,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       var note = document.createElement("span");
       note.textContent = row[2];
       note.setAttribute("style", "color:#6b7280;white-space:nowrap;");
-      var cp = rssBtnNew("复制", null, "#93c5fd");
+      var cp = rssBtnNew(L("copy"), null, "#93c5fd");
       cp.setAttribute("data-url", row[1]);
       cp.addEventListener("click", function (ev) { rssCopy(ev.currentTarget.getAttribute("data-url")); });
       line.appendChild(tag);
@@ -1199,7 +1371,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     }
   }
   function reloadRss() {
-    rssStatus("加载中…");
+    rssStatus(L("loading"));
     return ipc("rss_base").then(function (b) {
       RSS_BASE = b || ["", "", ""];
       renderRssUrls();
@@ -1256,6 +1428,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
   function boot() {
     installBar();
     beginCapture();
+    syncLang();
     setInterval(watchNav, 1500);
   }
   if (document.readyState === "loading") {
@@ -1281,6 +1454,7 @@ pub fn open(app: &AppHandle, url: &str) -> Result<String, String> {
     let win = WebviewWindowBuilder::new(app, "browser", WebviewUrl::External(parsed))
         .title("C96 自控窗口 — WebView2")
         .inner_size(1100.0, 800.0)
+        .additional_browser_args(BROWSER_ARGS)
         .initialization_script(LINKS_INIT)
         .initialization_script(SNAPSHOT_INIT)
         .initialization_script(EXTRACT_INIT)
@@ -1312,14 +1486,15 @@ pub fn open(app: &AppHandle, url: &str) -> Result<String, String> {
 /// E3：主窗口 = 浏览器（外部 URL）+ C96 叠加搜索条 + 自动 RAG 采集。
 /// `visible=false`（静默模式）：创建即隐藏窗口，后台 RSS / 调度照常跑，
 /// 之后由单实例回调（非静默再次调用）唤出。
-pub fn open_main(app: &AppHandle, start_url: &str, visible: bool) -> Result<String, String> {
+pub fn open_main(app: &AppHandle, start_url: &str, visible: bool, small: bool) -> Result<String, String> {
     let parsed = tauri::Url::parse(start_url).map_err(|e| format!("invalid url: {}", e))?;
     let nav_app = app.clone();
     let load_app = app.clone();
     let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(parsed))
         .title("C96 — 浏览器 / RAG 采集")
-        .inner_size(1280.0, 860.0)
+        .inner_size(if small { 760.0 } else { 1280.0 }, if small { 540.0 } else { 860.0 })
         .visible(visible)
+        .additional_browser_args(BROWSER_ARGS)
         .initialization_script(LINKS_INIT)
         .initialization_script(SNAPSHOT_INIT)
         .initialization_script(EXTRACT_INIT)
@@ -1343,6 +1518,52 @@ pub fn open_main(app: &AppHandle, start_url: &str, visible: bool) -> Result<Stri
     return Ok("opened main browser -> ".to_string() + &current);
 }
 
+/// 当前事件表最后一条的 seq（爬取时用于区分"本页新产生"的入库事件）。
+pub fn last_event_seq() -> u64 {
+    let v = events().lock().unwrap_or_else(|e| e.into_inner());
+    return v.last().map(|e| e.seq).unwrap_or(0);
+}
+
+fn host_of(url: &str) -> String {
+    let s = url.split("://").nth(1).unwrap_or(url);
+    let h = s.split('/').next().unwrap_or(s);
+    return h.to_lowercase();
+}
+
+/// 浏览器逐页爬取：串行把候选导航进主窗口，等每页自动抽取入库事件出现再下一页。
+/// 窗口在屏内可见才渲染（静默时窗口很小）。
+pub struct CrawlReport {
+    pub stored: u64,
+    pub skipped: u64,
+    pub failed: u64,
+}
+
+pub fn crawl(app: &AppHandle, urls: &[String], query: &str) -> CrawlReport {
+    set_query(query);
+    let mut rep = CrawlReport { stored: 0, skipped: 0, failed: 0 };
+    for url in urls.iter() {
+        let host = host_of(url);
+        let base = last_event_seq();
+        let _ = raw_navigate(app, "main", url);
+        let t0 = std::time::Instant::now();
+        let mut done = false;
+        while t0.elapsed() < std::time::Duration::from_secs(25) {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            for e in list_events().iter().rev() {
+                if e.seq > base && e.kind.starts_with("store") && e.url.to_lowercase().contains(&host) {
+                    if e.kind == "store" { rep.stored += 1; }
+                    else if e.kind == "store-skip" { rep.skipped += 1; }
+                    else { rep.failed += 1; }
+                    done = true;
+                    break;
+                }
+            }
+            if done { break; }
+        }
+        if !done { rep.failed += 1; }
+    }
+    return rep;
+}
 
 /// E1 探针：报告自控窗口是否已开、当前 URL、注入的钩子名。
 pub fn probe(app: &AppHandle) -> Result<String, String> {
@@ -1404,6 +1625,15 @@ pub fn raw_navigate(app: &AppHandle, label: &str, url: &str) -> Result<String, S
     return run_on_webview(&win, move |pw| raw::navigate(pw, &url));
 }
 
+/// 在目标窗口执行 JS 并回传结果字符串（channel 回传，可跨线程调用）。
+pub fn eval_string(app: &AppHandle, label: &str, js: &str) -> Result<String, String> {
+    let win = app
+        .get_webview_window(label)
+        .ok_or_else(|| format!("no webview window {:?}", label))?;
+    let js = js.to_string();
+    return run_on_webview(&win, move |pw| raw::eval(pw, &js));
+}
+
 /// E2：安装 AddWebMessageReceived（webview2-rs 路径）。
 pub fn install_web_message(app: &AppHandle, label: &str) -> Result<String, String> {
     let win = app
@@ -1427,6 +1657,7 @@ fn install_dispatch(_pw: &tauri::webview::PlatformWebview, _app: AppHandle) -> S
 /// cfg 只放在 item 上（Rust 稳定版不允许把 cfg 属性放在块表达式上）。
 mod raw {
     use tauri::webview::PlatformWebview;
+    use windows::core::implement;
 
     #[cfg(windows)]
     pub fn info(pw: &PlatformWebview) -> String {
@@ -1456,6 +1687,16 @@ mod raw {
     #[cfg(not(windows))]
     pub fn navigate(_pw: &PlatformWebview, _url: &str) -> String {
         return "raw WebView2: only available on Windows".to_string();
+    }
+
+    #[cfg(windows)]
+    pub fn eval(pw: &PlatformWebview, js: &str) -> String {
+        return eval_win(pw, js);
+    }
+
+    #[cfg(not(windows))]
+    pub fn eval(_pw: &PlatformWebview, _js: &str) -> String {
+        return "raw eval: only available on Windows".to_string();
     }
 
     #[cfg(windows)]
@@ -1552,6 +1793,73 @@ mod raw {
             Ok(()) => "ICoreWebView2::Navigate -> ".to_string() + url,
             Err(e) => "Navigate failed: ".to_string() + &e.message().to_string(),
         };
+    }
+
+    static EVAL_RES: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+    #[cfg(windows)]
+    fn eval_res() -> &'static std::sync::Mutex<Option<String>> {
+        return EVAL_RES.get_or_init(|| std::sync::Mutex::new(None));
+    }
+
+    /// 在本 UI 线程泵一次消息（ExecuteScript 回调靠消息循环派发）。
+    #[cfg(windows)]
+    fn pump() {
+        use windows::Win32::UI::WindowsAndMessaging::DispatchMessageW;
+        use windows::Win32::UI::WindowsAndMessaging::PeekMessageW;
+        use windows::Win32::UI::WindowsAndMessaging::PM_REMOVE;
+        use windows::Win32::UI::WindowsAndMessaging::TranslateMessage;
+        use windows::Win32::UI::WindowsAndMessaging::MSG;
+        let mut m = MSG::default();
+        unsafe {
+            while PeekMessageW(&mut m, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[implement(webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2ExecuteScriptCompletedHandler)]
+    struct EvalHandler;
+
+    #[cfg(windows)]
+    impl webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2ExecuteScriptCompletedHandler_Impl for EvalHandler_Impl {
+        fn Invoke(
+            &self,
+            _errorcode: windows::core::HRESULT,
+            result: &windows::core::PCWSTR,
+        ) -> windows::core::Result<()> {
+            let s = unsafe { result.to_string().unwrap_or_default() };
+            *eval_res().lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    fn eval_win(pw: &PlatformWebview, js: &str) -> String {
+        let controller = pw.controller();
+        let core = match unsafe { controller.CoreWebView2() } {
+            Ok(c) => c,
+            Err(e) => {
+                return "eval CoreWebView2() failed: ".to_string() + &e.message().to_string();
+            }
+        };
+        *eval_res().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let handler: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2ExecuteScriptCompletedHandler =
+            EvalHandler.into();
+        let _ = unsafe { core.ExecuteScript(&windows::core::HSTRING::from(js), &handler) };
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(8) {
+            {
+                let g = eval_res().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(s) = g.as_ref() {
+                    return s.clone();
+                }
+            }
+            pump();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        return "eval: no result (timeout)".to_string();
     }
 }
 

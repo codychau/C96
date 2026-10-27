@@ -38,7 +38,8 @@ use crate::store::state::Topic;
 pub const DEFAULT_INTERVAL_SECS: u64 = 1800;   // 30 min
 pub const DEFAULT_FRESH_SECS: u64 = 6 * 3600;  // 6 h
 pub const DEFAULT_MAX: usize = 20;
-pub const DEFAULT_FETCH_N: usize = 5;
+// 每轮进网页抽正文的候选数（相关性排序后取前 N）；抓不到的退化为 SERP 片段。
+pub const DEFAULT_FETCH_N: usize = 10;
 pub const DEFAULT_SCHED_TICK_SECS: u64 = 60;
 
 /// 创建一个主题任务所需的参数（CLI 选项 / GUI 参数 → 这里）。
@@ -463,6 +464,43 @@ pub fn refresh(store: &mut Store, key: &str, o: &RunOpts, now: u64) -> Result<To
     }
     store.persist_state();
     return Ok(run);
+}
+
+/// 只搜候选 + 去重 + 相关性排序，取前 fetch_n 的 URL（供 GUI 用浏览器逐页爬）。
+/// 不抓取、不入库：把"抓正文"交给浏览器窗口（能过反爬），这里只产出有序的候选链接。
+pub fn candidate_urls(store: &Store, key: &str, o: &RunOpts) -> Result<Vec<String>, String> {
+    let idx = match state::find_topic(store.state(), key) {
+        Some(i) => i,
+        None => { return Err(format!("no such topic: {}", key)); }
+    };
+    let t = store.state().topics[idx].clone();
+    let plan = query::build_plan(&[t.query.clone()], &t.site, &t.engine);
+    let (cands, _reps) = engines::collect(&plan, t.max, &o.net);
+    let good: Vec<Candidate> = cands.into_iter().filter(|c| c.resolved && !c.url.is_empty()).collect();
+    let mut uniq = normalize::dedup(good);
+    let feats = query_features(&t.query);
+    uniq.sort_by(|a, b| {
+        let sa = relevance(&a.title, &a.snippet, &feats);
+        let sb = relevance(&b.title, &b.snippet, &feats);
+        return sb.cmp(&sa);
+    });
+    let urls: Vec<String> = uniq.iter().take(t.fetch_n).map(|c| c.url.clone()).collect();
+    return Ok(urls);
+}
+
+/// 浏览器爬完一轮后更新任务（runs / stored / 下次到期）并落盘。
+pub fn finalize_crawl(store: &mut Store, key: &str, stored: u64, now: u64) {
+    if let Some(slot) = state::find_topic(store.state(), key) {
+        let st = store.state_mut();
+        let tt = &mut st.topics[slot];
+        let iv = tt.interval_secs.saturating_mul(1000);
+        tt.last_run_ms = now;
+        tt.next_due_ms = now.saturating_add(iv);
+        tt.runs += 1;
+        tt.stored += stored;
+        tt.last_status = "ok".to_string();
+    }
+    store.persist_state();
 }
 
 /// 到期任务逐个刷新（顺序执行，避免对同一站点并发过猛）。

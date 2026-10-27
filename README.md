@@ -75,6 +75,8 @@ cd gui ; cargo build --release        # GUI → gui/target/release/c96-gui.exe
 
 **单实例 + 静默模式**：GUI 现在是单实例 —— 已经开着时再 `C96 gui` 不会多开进程，而是把已有窗口唤起置顶。给 AI / 脚本用的静默参数 `C96 gui --silent`：没启动就以**隐藏窗口**后台启动（RSS 服务、关键词调度照常跑），已经启动则**不唤起它的窗口**，桌面零打扰。
 
+**浏览器爬取（过反爬）**：`C96 research --query Q` 默认把搜索交给已在跑的 GUI，用浏览器把候选**逐页点进窗口**抽正文入库（能过知乎这类 HTTP 403）。静默 `C96 research --query Q --silent`：小窗运行（窗口必须在屏内可见才能渲染，不抢焦点）。浏览器**始终静音**（WebView2 `--mute-audio`），网页自动播放音乐/视频不会出声。`--headless` 走 ureq HTTP（无浏览器，部分站 403、正文短的被跳过）；`--cache-only` 只读本地 RAG。
+
 ### 3. 局域网 RSS
 ```powershell
 .\start-rss-lan.ps1                    # 默认 8787、无 token，打印本机 + 局域网订阅地址
