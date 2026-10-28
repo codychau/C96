@@ -20,10 +20,14 @@ use std::sync::OnceLock;
 
 use tauri::AppHandle;
 use tauri::Emitter;
+use tauri::LogicalPosition;
+use tauri::LogicalSize;
 use tauri::Manager;
+use tauri::PhysicalPosition;
+use tauri::PhysicalSize;
 use tauri::WebviewUrl;
-use tauri::WebviewWindow;
 use tauri::WebviewWindowBuilder;
+use tauri::WindowEvent;
 
 /// 所有 WebView2 窗口统一的 Chromium 参数：保留 wry 默认项，并永久静音，
 /// 避免网页自动播放音乐/视频产生噪声（`--mute-audio`）。
@@ -62,6 +66,65 @@ pub fn current_query() -> String {
     return g.clone();
 }
 
+/// 覆盖层当前模式：0 隐藏 / 1 RSS 面板 / 2 设置 / 3 遮罩。
+static UI_MODE: AtomicU64 = AtomicU64::new(0);
+
+fn overlay_show(app: &AppHandle) -> Result<tauri::Webview, String> {
+    let wv = app.get_webview("overlay").ok_or_else(|| "no overlay webview".to_string())?;
+    let _ = wv.show();
+    return Ok(wv);
+}
+
+pub fn ui_hide(app: &AppHandle) -> Result<String, String> {
+    let _ = eval_string(app, "overlay", "window.__C96_UI__&&window.__C96_UI__.hide();");
+    if let Some(wv) = app.get_webview("overlay") {
+        let _ = wv.hide();
+    }
+    UI_MODE.store(0, Ordering::Relaxed);
+    return Ok("ui hidden".to_string());
+}
+
+pub fn ui_command(app: &AppHandle, op: &str) -> Result<String, String> {
+    if op == "close" || op == "hide" {
+        return ui_hide(app);
+    }
+    if op == "panel" {
+        if UI_MODE.load(Ordering::Relaxed) == 1 {
+            return ui_hide(app);
+        }
+        overlay_show(app)?;
+        UI_MODE.store(1, Ordering::Relaxed);
+        let _ = eval_string(app, "overlay", "window.__C96_UI__&&window.__C96_UI__.panel();");
+        return Ok("panel".to_string());
+    }
+    if op == "settings" {
+        if UI_MODE.load(Ordering::Relaxed) == 2 {
+            return ui_hide(app);
+        }
+        overlay_show(app)?;
+        UI_MODE.store(2, Ordering::Relaxed);
+        let _ = eval_string(app, "overlay", "window.__C96_UI__&&window.__C96_UI__.settings();");
+        return Ok("settings".to_string());
+    }
+    return Ok("unknown ui op".to_string());
+}
+
+/// 浏览器爬取期间的稳定遮罩（独立覆盖层 WebView，不随目标页刷新）。
+pub fn ui_mask(app: &AppHandle, text: &str) {
+    if overlay_show(app).is_err() {
+        return;
+    }
+    UI_MODE.store(3, Ordering::Relaxed);
+    let lit = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    let _ = eval_string(app, "overlay", &format!("window.__C96_UI__&&window.__C96_UI__.mask({});", lit));
+}
+
+pub fn ui_mask_hide(app: &AppHandle) {
+    if UI_MODE.load(Ordering::Relaxed) == 3 {
+        let _ = ui_hide(app);
+    }
+}
+
 fn now_ms() -> u128 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => return d.as_millis(),
@@ -98,8 +161,8 @@ fn rss_reply_js(id: &str, ok: bool, payload: &str) -> String {
         + &id_lit + ", " + (if ok { "true" } else { "false" }) + ", " + &data_lit + "); } })();";
 }
 
-/// 解析页面 postMessage 的 JSON 负载。
-pub fn ingest(app: &AppHandle, raw: &str) {
+/// 解析页面 postMessage 的 JSON 负载（`label` 是发送方 WebView，用于回送回复）。
+pub fn ingest(app: &AppHandle, label: &str, raw: &str) {
     let v: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => {
@@ -112,7 +175,38 @@ pub fn ingest(app: &AppHandle, raw: &str) {
     let detail = v.get("detail").and_then(|x| x.as_str()).unwrap_or("");
     if kind == "search" {
         set_query(detail);
+        let target = v.get("target").and_then(|x| x.as_str()).unwrap_or("");
+        if !target.is_empty() {
+            let _ = raw_navigate(app, "main", target);
+        }
         record(app, "search", url, detail);
+        let _ = eval_string(app, "toolbar", "window.__C96_STATUS__&&window.__C96_STATUS__('搜索中…')");
+        return;
+    }
+    if kind == "navigate" {
+        set_query(v.get("query").and_then(|x| x.as_str()).unwrap_or(""));
+        if !detail.is_empty() {
+            let _ = raw_navigate(app, "main", detail);
+        }
+        record(app, "navigate", detail, "");
+        return;
+    }
+    if kind == "cmd" {
+        let cmd = detail.to_string();
+        let a = app.clone();
+        std::thread::spawn(move || {
+            if cmd == "capture" {
+                let _ = eval_string(&a, "main", "window.__C96_CAPTURE__&&window.__C96_CAPTURE__();");
+            }
+        });
+        return;
+    }
+    if kind == "ui" {
+        let op = detail.to_string();
+        let a = app.clone();
+        std::thread::spawn(move || {
+            let _ = ui_command(&a, &op);
+        });
         return;
     }
     if kind == "capture" {
@@ -128,10 +222,21 @@ pub fn ingest(app: &AppHandle, raw: &str) {
             return;
         }
         let q = current_query();
-        match crate::store::save_capture(app, url, title, text, &q, 200, mode) {
-            Ok(msg) => record(app, "store", url, &format!("{} · {} 链接{:.0}%{}", msg, mode, lr * 100.0, if sel.is_empty() { String::new() } else { format!(" · {}", sel) })),
-            Err(e) => record(app, "store-error", url, &e),
-        }
+        let saved = match crate::store::save_capture(app, url, title, text, &q, 200, mode) {
+            Ok(msg) => {
+                record(app, "store", url, &format!("{} · {} 链接{:.0}%{}", msg, mode, lr * 100.0, if sel.is_empty() { String::new() } else { format!(" · {}", sel) }));
+                true
+            }
+            Err(e) => {
+                record(app, "store-error", url, &e);
+                false
+            }
+        };
+        let a = app.clone();
+        std::thread::spawn(move || {
+            let msg = if saved { "已收录当前页面" } else { "收录失败" };
+            let _ = eval_string(&a, "toolbar", &format!("window.__C96_STATUS__&&window.__C96_STATUS__({});", serde_json::to_string(msg).unwrap_or_default()));
+        });
         return;
     }
     if kind == "rss" {
@@ -139,6 +244,7 @@ pub fn ingest(app: &AppHandle, raw: &str) {
         let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("").to_string();
         let args = v.get("args").cloned().unwrap_or(serde_json::Value::Null);
         let app2 = app.clone();
+        let src = label.to_string();
         // 不能在 webview 事件回调里同步 eval（可能自锁），丢到线程里算完再回送
         std::thread::spawn(move || {
             let (ok, payload, note) = match crate::store::rss_op(&app2, &op, &args) {
@@ -146,8 +252,9 @@ pub fn ingest(app: &AppHandle, raw: &str) {
                 Err(e) => (false, serde_json::Value::String(e.clone()).to_string(), e),
             };
             record(&app2, "rss-op", &op, &note);
-            if let Some(w) = app2.get_webview_window("main") {
-                let _ = w.eval(&rss_reply_js(&id, ok, &payload));
+            let _ = eval_string(&app2, &src, &rss_reply_js(&id, ok, &payload));
+            if op == "lang_set" {
+                let _ = eval_string(&app2, "toolbar", &format!("window.__C96_SET_LANG__&&window.__C96_SET_LANG__({});", payload));
             }
         });
         return;
@@ -476,6 +583,7 @@ pub const LINKS_INIT: &str = r##"(function () {
 pub const OVERLAY_INIT: &str = r##"(function () {
   if (window.__C96_BAR__) { return; }
   window.__C96_BAR__ = true;
+  var MODE = window.__C96_MODE__ || "content";
   var UI_LANG = "zh";
   try { var _cached = localStorage.getItem("c96.uiLang"); if (_cached === "en") { UI_LANG = "en"; } } catch (e) {}
   var I18N = {
@@ -578,6 +686,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     return b;
   }
   function openSettings() {
+    if (MODE === "toolbar") { post("ui", "settings"); return null; }
     var d = document.getElementById("c96-settings");
     if (!d) {
       d = document.createElement("div");
@@ -617,8 +726,8 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       close.className = "c96-set-close";
       close.textContent = L("close");
       close.setAttribute("style", "height:30px;padding:0 14px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
-      close.addEventListener("click", function () { d.style.display = "none"; });
-      d.addEventListener("click", function (ev) { if (ev.target === d) { d.style.display = "none"; } });
+      close.addEventListener("click", function () { d.style.display = "none"; if (MODE === "overlay") { post("ui", "close"); } });
+      d.addEventListener("click", function (ev) { if (ev.target === d) { d.style.display = "none"; if (MODE === "overlay") { post("ui", "close"); } } });
       foot.appendChild(close);
       card.appendChild(h); card.appendChild(lb); card.appendChild(sel); card.appendChild(hint); card.appendChild(foot);
       d.appendChild(card);
@@ -627,6 +736,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     d.style.display = "flex";
     var cur = document.getElementById("c96-lang-sel");
     if (cur) { cur.value = UI_LANG; }
+    return d;
   }
   function post(type, detail, extra) {
     var payload = { type: type, url: location.href, detail: detail };
@@ -666,13 +776,11 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       if (e.key !== "Enter") { return; }
       var q = input.value.trim();
       if (!q) { return; }
-      post("search", q);
+      var target = (q.indexOf("http://") === 0 || q.indexOf("https://") === 0)
+        ? q
+        : "https://www.bing.com/search?q=" + encodeURIComponent(q);
+      post("search", q, { target: target });
       status.textContent = "搜索中…";
-      if (q.indexOf("http://") === 0 || q.indexOf("https://") === 0) {
-        location.href = q;
-      } else {
-        location.href = "https://www.bing.com/search?q=" + encodeURIComponent(q);
-      }
     });
     bar.appendChild(label);
     bar.appendChild(input);
@@ -684,7 +792,13 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     snapBtn.addEventListener("click", function (e) {
       e.preventDefault();
       e.stopPropagation();
-      capture();
+      if (MODE === "toolbar") {
+        var st = document.getElementById("c96-status");
+        if (st) { st.textContent = "收录中…"; }
+        post("cmd", "capture");
+      } else {
+        capture();
+      }
     });
     bar.appendChild(snapBtn);
     // RSS 内容管理器：顶部工具栏图标 -> 弹层（增删改查）
@@ -709,9 +823,6 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     bar.appendChild(setBtn);
     var root = document.body || document.documentElement;
     root.appendChild(bar);
-    try {
-      if (document.body && !document.body.style.paddingTop) { document.body.style.paddingTop = "46px"; }
-    } catch (e) {}
     input.focus();
   }
   // E7：自动入库的正文抽取 —— 不再用整页 innerText（会把菜单/侧栏/推荐一起摘进来）。
@@ -858,7 +969,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     st.setAttribute("style", "flex:1;color:#9aa4b2;font-size:12px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
     var reload = rssBtnNew(L("refresh"), "c96-rss-reload");
     var close = rssBtnNew("×", "c96-rss-close", "#f87171");
-    close.addEventListener("click", function () { p.style.display = "none"; });
+    close.addEventListener("click", function () { p.style.display = "none"; if (MODE === "overlay") { post("ui", "close"); } });
     reload.addEventListener("click", function () { reloadRss(); });
     head.appendChild(title);
     head.appendChild(st);
@@ -1396,6 +1507,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     }).catch(function (e) { rssStatus("加载失败：" + e); });
   }
   function toggleRssPanel() {
+    if (MODE === "toolbar") { post("ui", "panel"); return; }
     installRssPanel();
     var p = document.getElementById("c96-rss-panel");
     if (!p) { return; }
@@ -1425,11 +1537,86 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     reply: rssReply,
     post: post
   };
+  function maskShow(text) {
+    var m = document.getElementById("c96-mask");
+    if (!m) {
+      m = document.createElement("div");
+      m.id = "c96-mask";
+      m.setAttribute("style", "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483646;background:rgba(20,22,26,.9);color:#f0f4f8;font:15px/1.6 system-ui,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;");
+      var t = document.createElement("div");
+      t.id = "c96-mask-text";
+      t.setAttribute("style", "padding:14px 18px;background:rgba(28,32,39,.96);border:1px solid #3a4150;border-radius:12px;box-shadow:0 12px 34px rgba(0,0,0,.5);max-width:80%;text-align:center;");
+      m.appendChild(t);
+      (document.body || document.documentElement).appendChild(m);
+    }
+    m.style.display = "flex";
+    var tx = document.getElementById("c96-mask-text");
+    if (tx) { tx.textContent = text || ""; }
+  }
+  function maskHide() {
+    var m = document.getElementById("c96-mask");
+    if (m) { m.style.display = "none"; }
+  }
+  window.__C96_UI__ = {
+    panel: function () {
+      maskHide();
+      var d = document.getElementById("c96-settings");
+      if (d) { d.style.display = "none"; }
+      installRssPanel();
+      var p = document.getElementById("c96-rss-panel");
+      if (p) { p.style.display = "block"; p.style.maxHeight = "calc(100vh - 74px)"; }
+      return reloadRss();
+    },
+    settings: function () {
+      maskHide();
+      var p = document.getElementById("c96-rss-panel");
+      if (p) { p.style.display = "none"; }
+      var d = openSettings();
+      if (d) { d.style.display = "flex"; }
+    },
+    mask: function (t) {
+      var p = document.getElementById("c96-rss-panel");
+      if (p) { p.style.display = "none"; }
+      var d = document.getElementById("c96-settings");
+      if (d) { d.style.display = "none"; }
+      maskShow(t);
+    },
+    hide: function () {
+      maskHide();
+      var p = document.getElementById("c96-rss-panel");
+      if (p) { p.style.display = "none"; }
+      var d = document.getElementById("c96-settings");
+      if (d) { d.style.display = "none"; }
+    }
+  };
   function boot() {
-    installBar();
-    beginCapture();
-    syncLang();
-    setInterval(watchNav, 1500);
+    if (MODE === "toolbar") {
+      document.documentElement.style.background = "#14161a";
+      if (document.body) { document.body.style.background = "#14161a"; }
+      installBar();
+      window.__C96_STATUS__ = function (m) {
+        var el = document.getElementById("c96-status");
+        if (el) { el.textContent = m; }
+      };
+      window.__C96_SET_LANG__ = function (l) {
+        UI_LANG = (l === "en") ? "en" : "zh";
+        applyLang();
+      };
+      syncLang();
+      setTimeout(syncLang, 1200);
+    } else if (MODE === "overlay") {
+      document.documentElement.style.background = "#14161a";
+      if (document.body) { document.body.style.background = "#14161a"; }
+      syncLang();
+      setTimeout(syncLang, 1200);
+    } else if (MODE === "content") {
+      window.__C96_CAPTURE__ = capture;
+      try {
+        if (document.body && !document.body.style.paddingTop) { document.body.style.paddingTop = "46px"; }
+      } catch (e) {}
+      beginCapture();
+      setInterval(watchNav, 1500);
+    }
   }
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot);
@@ -1495,6 +1682,7 @@ pub fn open_main(app: &AppHandle, start_url: &str, visible: bool, small: bool) -
         .inner_size(if small { 760.0 } else { 1280.0 }, if small { 540.0 } else { 860.0 })
         .visible(visible)
         .additional_browser_args(BROWSER_ARGS)
+        .initialization_script("window.__C96_MODE__='content';")
         .initialization_script(LINKS_INIT)
         .initialization_script(SNAPSHOT_INIT)
         .initialization_script(EXTRACT_INIT)
@@ -1515,6 +1703,48 @@ pub fn open_main(app: &AppHandle, start_url: &str, visible: bool, small: bool) -
         .build()
         .map_err(|e| e.to_string())?;
     let current = win.url().map(|u| u.to_string()).unwrap_or_default();
+    // 原生多 WebView：内容页在下，覆盖层居中，顶栏最上。
+    // 顶栏/覆盖层是独立 WebView，目标页导航不会刷新它们。
+    let win_handle = app.get_window("main").ok_or_else(|| "no main window".to_string())?;
+    let scale = win_handle.scale_factor().unwrap_or(1.0);
+    let wsize = win_handle.inner_size().map_err(|e| e.to_string())?;
+    let lw = wsize.width as f64 / scale;
+    let lh = wsize.height as f64 / scale;
+    let overlay = win_handle
+        .add_child(
+            tauri::webview::WebviewBuilder::new("overlay", WebviewUrl::App("blank.html".into()))
+                .initialization_script("window.__C96_MODE__='overlay';")
+                .initialization_script(OVERLAY_INIT)
+                .additional_browser_args(BROWSER_ARGS)
+                .auto_resize()
+                .focused(false),
+            LogicalPosition::new(0.0, 0.0),
+            LogicalSize::new(lw, lh),
+        )
+        .map_err(|e| e.to_string())?;
+    let _ = overlay.hide();
+    let toolbar = win_handle
+        .add_child(
+            tauri::webview::WebviewBuilder::new("toolbar", WebviewUrl::App("blank.html".into()))
+                .initialization_script("window.__C96_MODE__='toolbar';")
+                .initialization_script(OVERLAY_INIT)
+                .additional_browser_args(BROWSER_ARGS)
+                .focused(false),
+            LogicalPosition::new(0.0, 0.0),
+            LogicalSize::new(lw, 46.0),
+        )
+        .map_err(|e| e.to_string())?;
+    let toolbar2 = toolbar.clone();
+    let win2 = win_handle.clone();
+    win_handle.on_window_event(move |ev| {
+        if let WindowEvent::Resized(size) = ev {
+            let scale = win2.scale_factor().unwrap_or(1.0);
+            let _ = toolbar2.set_size(PhysicalSize::new(size.width, (46.0 * scale).round() as u32));
+            let _ = toolbar2.set_position(PhysicalPosition::new(0, 0));
+        }
+    });
+    let _ = install_web_message(app, "overlay");
+    let _ = install_web_message(app, "toolbar");
     return Ok("opened main browser -> ".to_string() + &current);
 }
 
@@ -1540,9 +1770,12 @@ pub struct CrawlReport {
 
 pub fn crawl(app: &AppHandle, urls: &[String], query: &str) -> CrawlReport {
     set_query(query);
+    ui_mask(app, "自动操作中，请勿操作控件，会导致中断");
+    let n = urls.len();
     let mut rep = CrawlReport { stored: 0, skipped: 0, failed: 0 };
-    for url in urls.iter() {
+    for (i, url) in urls.iter().enumerate() {
         let host = host_of(url);
+        ui_mask(app, &format!("自动操作中 {}/{}：{} · 请勿操作控件，会导致中断", i + 1, n, host));
         let base = last_event_seq();
         let _ = raw_navigate(app, "main", url);
         let t0 = std::time::Instant::now();
@@ -1562,6 +1795,7 @@ pub fn crawl(app: &AppHandle, urls: &[String], query: &str) -> CrawlReport {
         }
         if !done { rep.failed += 1; }
     }
+    ui_mask_hide(app);
     return rep;
 }
 
@@ -1586,12 +1820,12 @@ pub fn probe(app: &AppHandle) -> Result<String, String> {
 
 /// 把闭包放到 webview 主线程执行并取回字符串结果。
 /// with_webview 的闭包必须 Send + 'static，所以用 channel 回传。
-fn run_on_webview<F>(win: &WebviewWindow, f: F) -> Result<String, String>
+fn run_on_webview<F>(wv: &tauri::Webview, f: F) -> Result<String, String>
 where
     F: FnOnce(&tauri::webview::PlatformWebview) -> String + Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel::<String>();
-    win.with_webview(move |pw| {
+    wv.with_webview(move |pw| {
         let _ = tx.send(f(&pw));
     })
     .map_err(|e| e.to_string())?;
@@ -1600,56 +1834,51 @@ where
         .map_err(|e| format!("with_webview timeout: {}", e));
 }
 
+fn webview_of(app: &AppHandle, label: &str) -> Result<tauri::Webview, String> {
+    return app.get_webview(label).ok_or_else(|| format!("no webview {:?}", label));
+}
+
 /// 直接读底层 WebView2 状态（webview2-rs 路径）。
 pub fn raw_info(app: &AppHandle, label: &str) -> Result<String, String> {
-    let win = app
-        .get_webview_window(label)
-        .ok_or_else(|| format!("no webview window {:?}", label))?;
-    return run_on_webview(&win, |pw| raw::info(pw));
+    let wv = webview_of(app, label)?;
+    return run_on_webview(&wv, |pw| raw::info(pw));
 }
 
 /// 直接改 WebView2 缩放（webview2-rs 路径）。
 pub fn raw_zoom(app: &AppHandle, label: &str, factor: f64) -> Result<String, String> {
-    let win = app
-        .get_webview_window(label)
-        .ok_or_else(|| format!("no webview window {:?}", label))?;
-    return run_on_webview(&win, move |pw| raw::zoom(pw, factor));
+    let wv = webview_of(app, label)?;
+    return run_on_webview(&wv, move |pw| raw::zoom(pw, factor));
 }
 
 /// 直接用 ICoreWebView2::Navigate 导航（webview2-rs 路径）。
 pub fn raw_navigate(app: &AppHandle, label: &str, url: &str) -> Result<String, String> {
-    let win = app
-        .get_webview_window(label)
-        .ok_or_else(|| format!("no webview window {:?}", label))?;
+    let wv = webview_of(app, label)?;
     let url = url.to_string();
-    return run_on_webview(&win, move |pw| raw::navigate(pw, &url));
+    return run_on_webview(&wv, move |pw| raw::navigate(pw, &url));
 }
 
 /// 在目标窗口执行 JS 并回传结果字符串（channel 回传，可跨线程调用）。
 pub fn eval_string(app: &AppHandle, label: &str, js: &str) -> Result<String, String> {
-    let win = app
-        .get_webview_window(label)
-        .ok_or_else(|| format!("no webview window {:?}", label))?;
+    let wv = webview_of(app, label)?;
     let js = js.to_string();
-    return run_on_webview(&win, move |pw| raw::eval(pw, &js));
+    return run_on_webview(&wv, move |pw| raw::eval(pw, &js));
 }
 
 /// E2：安装 AddWebMessageReceived（webview2-rs 路径）。
 pub fn install_web_message(app: &AppHandle, label: &str) -> Result<String, String> {
-    let win = app
-        .get_webview_window(label)
-        .ok_or_else(|| format!("no webview window {:?}", label))?;
+    let wv = webview_of(app, label)?;
     let app2 = app.clone();
-    return run_on_webview(&win, move |pw| install_dispatch(pw, app2));
+    let label2 = label.to_string();
+    return run_on_webview(&wv, move |pw| install_dispatch(pw, app2, label2));
 }
 
 #[cfg(windows)]
-fn install_dispatch(pw: &tauri::webview::PlatformWebview, app: AppHandle) -> String {
-    return raw_events::install(pw, app);
+fn install_dispatch(pw: &tauri::webview::PlatformWebview, app: AppHandle, label: String) -> String {
+    return raw_events::install(pw, app, label);
 }
 
 #[cfg(not(windows))]
-fn install_dispatch(_pw: &tauri::webview::PlatformWebview, _app: AppHandle) -> String {
+fn install_dispatch(_pw: &tauri::webview::PlatformWebview, _app: AppHandle, _label: String) -> String {
     return "web message: Windows only".to_string();
 }
 
@@ -1881,7 +2110,9 @@ mod raw_events {
     static APP: OnceLock<AppHandle> = OnceLock::new();
 
     #[implement(ICoreWebView2WebMessageReceivedEventHandler)]
-    struct WebMsgHandler;
+    struct WebMsgHandler {
+        label: String,
+    }
 
     fn read_and_free(p: PWSTR) -> String {
         let s = unsafe { p.to_string().unwrap_or_default() };
@@ -1913,14 +2144,14 @@ mod raw_events {
             }
             if !text.is_empty() {
                 if let Some(app) = APP.get() {
-                    super::ingest(app, &text);
+                    super::ingest(app, &self.label, &text);
                 }
             }
             return Ok(());
         }
     }
 
-    pub fn install(pw: &PlatformWebview, app: AppHandle) -> String {
+    pub fn install(pw: &PlatformWebview, app: AppHandle, label: String) -> String {
         let _ = APP.set(app);
         unsafe {
             let core = match pw.controller().CoreWebView2() {
@@ -1929,7 +2160,7 @@ mod raw_events {
                     return "CoreWebView2 failed: ".to_string() + &e.message().to_string();
                 }
             };
-            let handler: ICoreWebView2WebMessageReceivedEventHandler = WebMsgHandler.into();
+            let handler: ICoreWebView2WebMessageReceivedEventHandler = WebMsgHandler { label }.into();
             return match core.add_WebMessageReceived(&handler, std::ptr::null_mut()) {
                 Ok(()) => "add_WebMessageReceived installed".to_string(),
                 Err(e) => "add_WebMessageReceived failed: ".to_string() + &e.message().to_string(),

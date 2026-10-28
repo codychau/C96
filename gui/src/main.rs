@@ -83,8 +83,8 @@ fn rss_base() -> store::RssBase {
 
 /// 事件通过 Tauri IPC 兜底回传（首选是 WebView2 原生 postMessage）。
 #[tauri::command]
-fn browser_event(app: tauri::AppHandle, payload: String) -> Result<(), String> {
-    browser::ingest(&app, &payload);
+fn browser_event(app: tauri::AppHandle, webview: tauri::Webview, payload: String) -> Result<(), String> {
+    browser::ingest(&app, webview.label(), &payload);
     return Ok(());
 }
 
@@ -409,8 +409,17 @@ fn run_selftest_rss_ui(app: tauri::AppHandle) {
     std::thread::sleep(std::time::Duration::from_millis(3000));
     let win = match app.get_webview_window("main") {
         Some(w) => w,
-        None => { println!("[selftest-rss-ui] 主窗口不存在"); app.exit(0); return; }
+        None => { println!("[selftest-rss-ui] no main window"); app.exit(0); return; }
     };
+    let bar = match app.get_webview("toolbar") {
+        Some(w) => w,
+        None => { println!("[selftest-rss-ui] no toolbar webview"); app.exit(0); return; }
+    };
+    let ov = match app.get_webview("overlay") {
+        Some(w) => w,
+        None => { println!("[selftest-rss-ui] no overlay webview"); app.exit(0); return; }
+    };
+    let _ = &win;
     // 用本地页跑，隔离真站 SPA 的干扰
     let dir = std::env::temp_dir().join("c96_rss_ui");
     let _ = std::fs::create_dir_all(&dir);
@@ -421,17 +430,17 @@ fn run_selftest_rss_ui(app: tauri::AppHandle) {
     std::thread::sleep(std::time::Duration::from_millis(2500));
 
     // 0) 防御性探针：确认注入脚本/图标/IPC 是否就位（不依赖面板自己的上报）
-    let _ = win.eval(&post_js("'probe bar=' + !!document.getElementById('c96-bar') + ' btn=' + !!document.getElementById('c96-rss-btn') + ' ui=' + (typeof window.__C96_RSS_UI__) + ' ipc=' + !!(window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke)"));
+    let _ = bar.eval(&post_js("'probe bar=' + !!document.getElementById('c96-bar') + ' btn=' + !!document.getElementById('c96-rss-btn') + ' ui=' + (typeof window.__C96_RSS_UI__) + ' ipc=' + !!(window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke)"));
     std::thread::sleep(std::time::Duration::from_millis(600));
 
     // 1) 点顶部工具栏图标 -> 面板打开并加载数据
-    let _ = win.eval("document.getElementById('c96-rss-btn') && document.getElementById('c96-rss-btn').click();");
+    let _ = bar.eval("document.getElementById('c96-rss-btn') && document.getElementById('c96-rss-btn').click();");
     std::thread::sleep(std::time::Duration::from_millis(900));
-    let _ = win.eval(&post_js("'afterClick panel=' + !!document.getElementById('c96-rss-panel') + ' display=' + (document.getElementById('c96-rss-panel') ? document.getElementById('c96-rss-panel').style.display : '-')"));
-    let _ = win.eval("window.__C96_RSS_UI__ && window.__C96_RSS_UI__.reload();");
+    let _ = ov.eval(&post_js("'afterClick panel=' + !!document.getElementById('c96-rss-panel') + ' display=' + (document.getElementById('c96-rss-panel') ? document.getElementById('c96-rss-panel').style.display : '-')"));
+    let _ = ov.eval("window.__C96_RSS_UI__ && window.__C96_RSS_UI__.reload();");
     std::thread::sleep(std::time::Duration::from_millis(3000));
-    let _ = win.eval(&post_js("'reload 状态=' + (document.getElementById('c96-rss-status') ? document.getElementById('c96-rss-status').textContent : '-')"));
-    let _ = win.eval(&post_js("'panel=' + (document.getElementById('c96-rss-panel') ? document.getElementById('c96-rss-panel').style.display : 'missing') + ' 订阅行=' + document.querySelectorAll('#c96-rss-topics > div').length + ' 来源行=' + document.querySelectorAll('#c96-rss-sources > div').length + ' 地址行=' + document.querySelectorAll('#c96-rss-urls > div').length"));
+    let _ = ov.eval(&post_js("'reload 状态=' + (document.getElementById('c96-rss-status') ? document.getElementById('c96-rss-status').textContent : '-')"));
+    let _ = ov.eval(&post_js("'panel=' + (document.getElementById('c96-rss-panel') ? document.getElementById('c96-rss-panel').style.display : 'missing') + ' 订阅行=' + document.querySelectorAll('#c96-rss-topics > div').length + ' 来源行=' + document.querySelectorAll('#c96-rss-sources > div').length + ' 地址行=' + document.querySelectorAll('#c96-rss-urls > div').length"));
     std::thread::sleep(std::time::Duration::from_millis(700));
 
     // 1.5) 造 3 条「随手收录」（source=gui-browser，query 空）—— 模拟随便搜索/打开的页面
@@ -456,7 +465,7 @@ fn run_selftest_rss_ui(app: tauri::AppHandle) {
     let q = "c96 rss 管理器自检";
     let js_add = "(function(){ document.getElementById('c96-rss-new-q').value = '".to_string()
         + q + "'; document.getElementById('c96-rss-new-int').value = '600'; document.getElementById('c96-rss-add').click(); })();";
-    let _ = win.eval(&js_add);
+    let _ = ov.eval(&js_add);
     std::thread::sleep(std::time::Duration::from_millis(22000));
     let key = c96::store::state::topic_key(q);
     let added = store::topic_list(&app).unwrap_or_default().into_iter().find(|t| t.key == key);
@@ -479,42 +488,42 @@ fn run_selftest_rss_ui(app: tauri::AppHandle) {
         if on_shown < off_shown && on_junk >= 2 { "OK" } else { "FAIL" }, off_shown, on_shown, on_junk, filt_junk);
 
     // 3) 改：界面改间隔 -> 900
-    let _ = win.eval(&("(function(){ var i = document.getElementById('c96-rss-int-".to_string() + &key
+    let _ = ov.eval(&("(function(){ var i = document.getElementById('c96-rss-int-".to_string() + &key
         + "'); var b = document.getElementById('c96-rss-save-" + &key
         + "'); if (i) { i.value = '900'; } if (b) { b.click(); } })();"));
     let probe_el = "'UI 元素 间隔输入=' + (document.getElementById('c96-rss-int-".to_string() + &key
         + "') ? 'yes' : 'no') + ' 保存按钮=' + (document.getElementById('c96-rss-save-" + &key + "') ? 'yes' : 'no')";
-    let _ = win.eval(&post_js(&probe_el));
+    let _ = ov.eval(&post_js(&probe_el));
     std::thread::sleep(std::time::Duration::from_millis(2200));
     let iv = store::topic_list(&app).unwrap_or_default().into_iter().find(|t| t.key == key).map(|t| t.interval_secs).unwrap_or(0);
     println!("[selftest-rss-ui] 2) 改 {}: 界面改间隔后 = {}s（期望 900）", if iv == 900 { "OK" } else { "FAIL" }, iv);
 
     // 4) 查：界面展开「条目」
-    let _ = win.eval(&("(function(){ var b = document.getElementById('c96-rss-docs-".to_string() + &key + "'); if (b) { b.click(); } })();"));
+    let _ = ov.eval(&("(function(){ var b = document.getElementById('c96-rss-docs-".to_string() + &key + "'); if (b) { b.click(); } })();"));
     std::thread::sleep(std::time::Duration::from_millis(3000));
-    let _ = win.eval(&("(function(){ var box = document.getElementById('c96-rss-items-".to_string() + &key
+    let _ = ov.eval(&("(function(){ var box = document.getElementById('c96-rss-items-".to_string() + &key
         + "'); })();"));
     let box_js = "document.getElementById('c96-rss-items-".to_string() + &key + "')";
     let probe_items = "'条目行=' + (".to_string() + &box_js + " ? " + &box_js + ".children.length : -1) + ' 首行=' + (" + &box_js + " ? " + &box_js + ".textContent.slice(0, 70) : '')";
-    let _ = win.eval(&post_js(&probe_items));
+    let _ = ov.eval(&post_js(&probe_items));
     std::thread::sleep(std::time::Duration::from_millis(700));
 
     // 4a) 全部内容区：真渲染 + 过滤（UI 输入框触发 250ms 防抖 reload）
-    let _ = win.eval("window.__C96_RSS_UI__ && window.__C96_RSS_UI__.reload();");
+    let _ = ov.eval("window.__C96_RSS_UI__ && window.__C96_RSS_UI__.reload();");
     std::thread::sleep(std::time::Duration::from_millis(2500));
-    let _ = win.eval(&post_js("'全部内容行=' + document.querySelectorAll('#c96-rss-docs > div').length + ' 计数=' + (document.getElementById('c96-rss-dcount') ? document.getElementById('c96-rss-dcount').textContent : '-') + ' 主机行=' + document.querySelectorAll('#c96-rss-hosts > div').length + ' 来源行按钮=' + document.querySelectorAll('#c96-rss-sources > div button').length"));
+    let _ = ov.eval(&post_js("'全部内容行=' + document.querySelectorAll('#c96-rss-docs > div').length + ' 计数=' + (document.getElementById('c96-rss-dcount') ? document.getElementById('c96-rss-dcount').textContent : '-') + ' 主机行=' + document.querySelectorAll('#c96-rss-hosts > div').length + ' 来源行按钮=' + document.querySelectorAll('#c96-rss-sources > div button').length"));
     std::thread::sleep(std::time::Duration::from_millis(700));
-    let _ = win.eval("(function(){ var el = document.getElementById('c96-rss-dq'); if (el) { el.value = 'C96JUNK-A'; el.dispatchEvent(new Event('input')); } })();");
+    let _ = ov.eval("(function(){ var el = document.getElementById('c96-rss-dq'); if (el) { el.value = 'C96JUNK-A'; el.dispatchEvent(new Event('input')); } })();");
     std::thread::sleep(std::time::Duration::from_millis(1800));
-    let _ = win.eval(&post_js("'过滤 C96JUNK-A 后 行=' + document.querySelectorAll('#c96-rss-docs > div').length + ' 计数=' + (document.getElementById('c96-rss-dcount') ? document.getElementById('c96-rss-dcount').textContent : '-')"));
+    let _ = ov.eval(&post_js("'过滤 C96JUNK-A 后 行=' + document.querySelectorAll('#c96-rss-docs > div').length + ' 计数=' + (document.getElementById('c96-rss-dcount') ? document.getElementById('c96-rss-dcount').textContent : '-')"));
     std::thread::sleep(std::time::Duration::from_millis(700));
 
     // 4b) 逐条删：界面两次点击（第一次变「确认?」）
     let del_row = "(function(){ var row = document.querySelector('#c96-rss-docs > div'); if (!row) { return 'norow'; } var bs = row.querySelectorAll('button'); if (!bs.length) { return 'nobtn'; } bs[bs.length - 1].click(); return 'clicked'; })();";
     // 点击驱动必须是裸 eval（post_js 会把表达式包进 String(...)，带 ; 的 IIFE 会解析失败）
-    let _ = win.eval(del_row);
+    let _ = ov.eval(del_row);
     std::thread::sleep(std::time::Duration::from_millis(900));
-    let _ = win.eval(del_row);
+    let _ = ov.eval(del_row);
     std::thread::sleep(std::time::Duration::from_millis(2200));
     let left_a = store::docs_all(&app, "C96JUNK-A", false, 300).ok()
         .and_then(|v| v.get("shown").and_then(|x| x.as_u64())).unwrap_or(1);
@@ -530,14 +539,14 @@ fn run_selftest_rss_ui(app: tauri::AppHandle) {
     let host_btn = |i: usize| -> String {
         return format!("(function(){{ var rows = document.querySelectorAll('#c96-rss-hosts > div'); for (var k = 0; k < rows.length; k++) {{ var nm = rows[k].firstElementChild; if (nm && nm.textContent === '{}') {{ var bs = rows[k].querySelectorAll('button'); if (bs.length <= {}) {{ return 'nobtn'; }} bs[{}].click(); return 'clicked'; }} }} return 'no-row'; }})();", junk_host, i, i);
     };
-    let _ = win.eval(&host_btn(1));
+    let _ = ov.eval(&host_btn(1));
     std::thread::sleep(std::time::Duration::from_millis(1800));
     let ig_on = store::ignored_hosts(&app).unwrap_or_default().iter().any(|h| h == junk_host);
     let skip_msg = store::save(&app, "https://c96-junk.example.com/skip-probe", "C96JUNK-SKIP", "ignored host probe body", "", 0).unwrap_or_default();
     println!("[selftest-rss-ui] 4c) 忽略站点 {}: 名单命中={} 新页面={}", if ig_on && skip_msg.starts_with("skip: ignored host") { "OK" } else { "FAIL" }, ig_on, skip_msg);
 
     // 4d) 取消忽略：应当恢复收录
-    let _ = win.eval(&host_btn(1));
+    let _ = ov.eval(&host_btn(1));
     std::thread::sleep(std::time::Duration::from_millis(1800));
     let ig_off = !store::ignored_hosts(&app).unwrap_or_default().iter().any(|h| h == junk_host);
     let again_msg = store::save(&app, "https://c96-junk.example.com/skip-probe", "C96JUNK-SKIP", "ignored host probe body", "", 0).unwrap_or_default();
@@ -545,9 +554,9 @@ fn run_selftest_rss_ui(app: tauri::AppHandle) {
 
     // 4e) 主机制「清空」：两次点击 -> 该站点内容归零
     let keep_btn = format!("(function(){{ var rows = document.querySelectorAll('#c96-rss-hosts > div'); for (var k = 0; k < rows.length; k++) {{ var nm = rows[k].firstElementChild; if (nm && nm.textContent === '{}') {{ var bs = rows[k].querySelectorAll('button'); if (!bs.length) {{ return 'nobtn'; }} bs[0].click(); return 'clicked'; }} }} return 'no-row'; }})();", keep_host);
-    let _ = win.eval(&keep_btn);
+    let _ = ov.eval(&keep_btn);
     std::thread::sleep(std::time::Duration::from_millis(900));
-    let _ = win.eval(&keep_btn);
+    let _ = ov.eval(&keep_btn);
     std::thread::sleep(std::time::Duration::from_millis(2200));
     let kept_left = store::docs_all(&app, keep_host, false, 300).ok()
         .and_then(|v| v.get("shown").and_then(|x| x.as_u64())).unwrap_or(1);
@@ -555,9 +564,9 @@ fn run_selftest_rss_ui(app: tauri::AppHandle) {
 
     // 5) 删：界面两次点击（第一次变「确认删除?」）
     let del_js = "(function(){ var b = document.getElementById('c96-rss-del-".to_string() + &key + "'); if (b) { b.click(); } })();";
-    let _ = win.eval(&del_js);
+    let _ = ov.eval(&del_js);
     std::thread::sleep(std::time::Duration::from_millis(900));
-    let _ = win.eval(&del_js);
+    let _ = ov.eval(&del_js);
     std::thread::sleep(std::time::Duration::from_millis(2600));
     let gone = !store::topic_list(&app).unwrap_or_default().iter().any(|t| t.key == key);
     println!("[selftest-rss-ui] 3) 删 {}: 订阅已{}", if gone { "OK" } else { "FAIL" }, if gone { "移除" } else { "仍存在" });
@@ -565,10 +574,10 @@ fn run_selftest_rss_ui(app: tauri::AppHandle) {
     // 6) 真站回归：外部 https 页面（Bing）上图标/面板同样可用
     let _ = browser::raw_navigate(&app, "main", "https://www.bing.com/");
     std::thread::sleep(std::time::Duration::from_secs(7));
-    let _ = win.eval(&post_js("'bing bar=' + !!document.getElementById('c96-bar') + ' btn=' + !!document.getElementById('c96-rss-btn')"));
-    let _ = win.eval("document.getElementById('c96-rss-btn') && document.getElementById('c96-rss-btn').click();");
+    let _ = bar.eval(&post_js("'bing bar=' + !!document.getElementById('c96-bar') + ' btn=' + !!document.getElementById('c96-rss-btn')"));
+    let _ = bar.eval("document.getElementById('c96-rss-btn') && document.getElementById('c96-rss-btn').click();");
     std::thread::sleep(std::time::Duration::from_millis(4000));
-    let _ = win.eval(&post_js("'bing panel=' + (document.getElementById('c96-rss-panel') ? document.getElementById('c96-rss-panel').style.display : 'missing') + ' 订阅行=' + document.querySelectorAll('#c96-rss-topics > div').length + ' 状态=' + (document.getElementById('c96-rss-status') ? document.getElementById('c96-rss-status').textContent : '-')"));
+    let _ = ov.eval(&post_js("'bing panel=' + (document.getElementById('c96-rss-panel') ? document.getElementById('c96-rss-panel').style.display : 'missing') + ' 订阅行=' + document.querySelectorAll('#c96-rss-topics > div').length + ' 状态=' + (document.getElementById('c96-rss-status') ? document.getElementById('c96-rss-status').textContent : '-')"));
     std::thread::sleep(std::time::Duration::from_millis(700));
 
     // 7) 面板上报 + 清理自检条目（顺便验证「删条目」）

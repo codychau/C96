@@ -13,7 +13,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # E1：pin 到 2.12（官方建议用 with_webview 时至少 pin 到 minor），
 # 其 webview2-com 依赖为 ^0.39，下面 target 依赖与之对齐以共用同一类型。
-tauri = { version = "2.12", features = [] }
+tauri = { version = "2.12", features = ["unstable"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # F：复用根 crate 的存储层（统一 KB 文件 + 指纹去重 + 30 天 TTL）
