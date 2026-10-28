@@ -1624,9 +1624,6 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       setTimeout(syncLang, 1200);
     } else if (MODE === "content") {
       window.__C96_CAPTURE__ = capture;
-      try {
-        if (document.body && !document.body.style.paddingTop) { document.body.style.paddingTop = "46px"; }
-      } catch (e) {}
       beginCapture();
       setInterval(watchNav, 1500);
     }
@@ -1723,6 +1720,11 @@ pub fn open_main(app: &AppHandle, start_url: &str, visible: bool, small: bool) -
     let wsize = win_handle.inner_size().map_err(|e| e.to_string())?;
     let lw = wsize.width as f64 / scale;
     let lh = wsize.height as f64 / scale;
+    let content_wv = app.get_webview("main").ok_or_else(|| "no main webview".to_string())?;
+    let top = (46.0 * scale).round() as i32;
+    let content_h = (wsize.height as f64 - top as f64).max(1.0).round() as u32;
+    let _ = content_wv.set_position(PhysicalPosition::new(0, top));
+    let _ = content_wv.set_size(PhysicalSize::new(wsize.width, content_h));
     let overlay = win_handle
         .add_child(
             tauri::webview::WebviewBuilder::new("overlay", WebviewUrl::App("blank.html".into()))
@@ -1749,12 +1751,18 @@ pub fn open_main(app: &AppHandle, start_url: &str, visible: bool, small: bool) -
         )
         .map_err(|e| e.to_string())?;
     let toolbar2 = toolbar.clone();
+    let main2 = content_wv.clone();
     let win2 = win_handle.clone();
     win_handle.on_window_event(move |ev| {
         if let WindowEvent::Resized(size) = ev {
             let scale = win2.scale_factor().unwrap_or(1.0);
-            let _ = toolbar2.set_size(PhysicalSize::new(size.width, (46.0 * scale).round() as u32));
+            let top = (46.0 * scale).round() as i32;
+            let toolbar_h = (46.0 * scale).round() as u32;
+            let content_h = (size.height as f64 - top as f64).max(1.0).round() as u32;
+            let _ = toolbar2.set_size(PhysicalSize::new(size.width, toolbar_h));
             let _ = toolbar2.set_position(PhysicalPosition::new(0, 0));
+            let _ = main2.set_position(PhysicalPosition::new(0, top));
+            let _ = main2.set_size(PhysicalSize::new(size.width, content_h));
         }
     });
     let _ = install_web_message(app, "overlay");
