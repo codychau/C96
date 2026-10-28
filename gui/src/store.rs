@@ -412,6 +412,64 @@ pub fn rss_op(app: &AppHandle, op: &str, args: &serde_json::Value) -> Result<ser
     match op {
         "lang_get" => { return Ok(serde_json::json!(ui_lang(app))); }
         "lang_set" => { return Ok(serde_json::json!(set_ui_lang(app, &sarg("lang"))?)); }
+        "capture_auto_get" => {
+            let arc = handle(app)?;
+            let g = arc.lock().unwrap_or_else(|e| e.into_inner());
+            return Ok(serde_json::json!(g.state().auto_capture));
+        }
+        "capture_auto_set" => {
+            let arc = handle(app)?;
+            let mut g = arc.lock().unwrap_or_else(|e| e.into_inner());
+            g.state_mut().auto_capture = barg("enabled").unwrap_or(false);
+            return Ok(serde_json::json!(g.persist_state()));
+        }
+        "embed_get" => {
+            let arc = handle(app)?;
+            let cfg = { let g = arc.lock().unwrap_or_else(|e| e.into_inner()); g.embed_config() };
+            return Ok(serde_json::json!({
+                "enabled": cfg.enabled,
+                "base_url": cfg.base_url,
+                "api_key": cfg.api_key,
+                "model": cfg.model,
+                "dim": cfg.dim,
+            }));
+        }
+        "embed_set" => {
+            let arc = handle(app)?;
+            let mut g = arc.lock().unwrap_or_else(|e| e.into_inner());
+            let old = g.embed_config();
+            let cfg = c96::store::state::EmbedConfig {
+                enabled: barg("enabled").unwrap_or(old.enabled),
+                base_url: sarg("base_url"),
+                api_key: sarg("api_key"),
+                model: sarg("model"),
+                dim: (args.get("dim").and_then(|v| v.as_u64()).unwrap_or(old.dim as u64)) as usize,
+            };
+            let ok = g.set_embed_config(cfg.clone());
+            let st = g.stats();
+            return Ok(serde_json::json!({ "ok": ok, "vec_docs": st.vec_docs, "embed_enabled": st.embed_enabled }));
+        }
+        "embed_test" => {
+            let arc = handle(app)?;
+            let msg = {
+                let g = arc.lock().unwrap_or_else(|e| e.into_inner());
+                let cfg = g.embed_config();
+                match c96::embed::embed(&cfg, "C96 vector model test") {
+                    Ok(v) => format!("OK dim={}", v.len()),
+                    Err(e) => format!("ERR {}", e),
+                }
+            };
+            return Ok(serde_json::json!(msg));
+        }
+        "embed_backfill" => {
+            let arc = handle(app)?;
+            let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20)) as usize;
+            let done = {
+                let mut g = arc.lock().unwrap_or_else(|e| e.into_inner());
+                g.backfill_vectors(limit)
+            };
+            return Ok(serde_json::json!(done));
+        }
         "base" => { return serde_json::to_value(rss_base()).map_err(|e| e.to_string()); }
         "topics" => { return serde_json::to_value(topic_list(app)?).map_err(|e| e.to_string()); }
         "sources" => { return serde_json::to_value(sources(app)?).map_err(|e| e.to_string()); }

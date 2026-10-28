@@ -285,6 +285,25 @@ fn run_selftest(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+const FORCE_CAPTURE_ON: &str = "window.__C96_SET_FORCE_CAPTURE__&&window.__C96_SET_FORCE_CAPTURE__(true);";
+const FORCE_CAPTURE_OFF: &str = "window.__C96_SET_FORCE_CAPTURE__&&window.__C96_SET_FORCE_CAPTURE__(false);";
+
+fn force_capture_once(app: &tauri::AppHandle) {
+    let _ = browser::eval_string(app, "main", FORCE_CAPTURE_ON);
+}
+
+fn force_capture_wait(app: &tauri::AppHandle, secs: u64) {
+    let t0 = std::time::Instant::now();
+    let dur = std::time::Duration::from_secs(secs);
+    while t0.elapsed() < dur {
+        let left = dur - t0.elapsed();
+        let step = if left.as_millis() < 600 { left } else { std::time::Duration::from_millis(600) };
+        std::thread::sleep(step);
+        force_capture_once(app);
+    }
+    let _ = browser::eval_string(app, "main", FORCE_CAPTURE_OFF);
+}
+
 /// E3 无人值守自检：导航主窗口到一个新 URL，确认正文被自动写入 RAG 并可检索。
 fn run_selftest_rag(app: tauri::AppHandle) {
     println!("[selftest-rag] start");
@@ -301,7 +320,7 @@ fn run_selftest_rag(app: tauri::AppHandle) {
         Err(e) => println!("[selftest-rag] navigate ERR: {}", e),
     }
     // E7：自动入库现在等「正文文本稳定」（最多 6 次 ≈ 6.8s）才送存，所以这里等 9s
-    std::thread::sleep(std::time::Duration::from_secs(9));
+    force_capture_wait(&app, 9);
     let after = store::stats(&app).map(|s| s.docs).unwrap_or(0);
     println!("[selftest-rag] kb after = {} (delta {})", after, after.saturating_sub(before));
     match store::search(&app, "Rust", 5) {
@@ -318,7 +337,7 @@ fn run_selftest_rag(app: tauri::AppHandle) {
         Ok(m) => println!("[selftest-rag] re-navigate -> {}", m),
         Err(e) => println!("[selftest-rag] re-navigate ERR: {}", e),
     }
-    std::thread::sleep(std::time::Duration::from_secs(9));
+    force_capture_wait(&app, 9);
     let last_store = browser::list_events().into_iter().rev().find(|e| e.kind == "store" || e.kind == "store-error");
     match last_store {
         Some(e) => println!("[selftest-rag] dup check -> kind={} detail={} url={}", e.kind, e.detail, e.url),
@@ -334,7 +353,7 @@ fn run_selftest_rag(app: tauri::AppHandle) {
             Err(e) => println!("[selftest-rag] search eval ERR: {}", e),
         }
     }
-    std::thread::sleep(std::time::Duration::from_secs(7));
+    force_capture_wait(&app, 7);
     match store::last(&app) {
         Some(d) => println!("[selftest-rag] last stored -> host={} title={} query={} text_len={}", d.host, d.title, d.query, d.text_len),
         None => println!("[selftest-rag] last stored -> none"),
@@ -699,7 +718,7 @@ fn run_selftest_extract(app: tauri::AppHandle) {
     let art_url = format!("file:///{}?c96={}", art.to_string_lossy().replace('\\', "/"), stamp);
     let _ = browser::raw_navigate(&app, "main", &art_url);
     // 抽取要等文本稳定（首读 1s + 稳定判定），短页面走 6 次兜底 ≈ 7s
-    std::thread::sleep(std::time::Duration::from_secs(9));
+    force_capture_wait(&app, 9);
     let after = store::stats(&app).map(|s| s.docs).unwrap_or(0);
     let doc = store::last(&app);
     let text = doc.as_ref().map(|d| d.text.clone()).unwrap_or_default();
@@ -744,7 +763,7 @@ fn run_selftest_extract(app: tauri::AppHandle) {
     let lp_url = format!("file:///{}?c96={}", lp.to_string_lossy().replace('\\', "/"), stamp + 1);
     let before2 = store::stats(&app).map(|s| s.docs).unwrap_or(0);
     let _ = browser::raw_navigate(&app, "main", &lp_url);
-    std::thread::sleep(std::time::Duration::from_secs(7));
+    force_capture_wait(&app, 7);
     let after2 = store::stats(&app).map(|s| s.docs).unwrap_or(0);
     let skips: Vec<String> = browser::list_events().into_iter()
         .filter(|e| e.kind == "store-skip" && e.url.contains("links.html"))
@@ -773,7 +792,7 @@ fn run_selftest_extract(app: tauri::AppHandle) {
         println!("[selftest-extract] 3) 真站重访 {} 个 URL（抽取后应替换旧的整页记录）", live_list.len());
         for u in live_list.iter() {
             let _ = browser::raw_navigate(&app, "main", u);
-            std::thread::sleep(std::time::Duration::from_secs(13));
+            force_capture_wait(&app, 13);
             let recent: Vec<String> = browser::list_events().into_iter()
                 .filter(|e| e.kind == "store" || e.kind == "store-skip" || e.kind == "store-error")
                 .rev().take(3)
@@ -923,6 +942,13 @@ fn spawn_crawl_scheduler(app: tauri::AppHandle) {
                         println!("[c96 crawl] \"{}\": {} 页 · 入库 {} · 跳过 {} · 失败 {}",
                             k, u.len(), rep.stored, rep.skipped, rep.failed);
                     }
+                }
+                if let Ok(arc) = store::handle(&app) {
+                    let done = {
+                        let mut g = arc.lock().unwrap_or_else(|e| e.into_inner());
+                        g.backfill_vectors(1)
+                    };
+                    if done > 0 { println!("[c96 embed] 后台补向量 {} 条", done); }
                 }
             }
             std::thread::sleep(std::time::Duration::from_secs(tick));

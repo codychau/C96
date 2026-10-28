@@ -592,6 +592,11 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       ready: "就绪", snap: "收录", snap_title: "手动收录当前页面的文章信息",
       settings: "设置", settings_title: "设置", ui_lang: "界面语言",
       lang_hint: "选择后立即生效，并记住到下次启动。", close: "关闭",
+      vector_title: "向量模型", vector_hint: "支持 OpenAI/Ollama 兼容 embeddings 接口；保存后新收录内容会写入向量，后台也会逐步补历史向量。",
+      auto_capture_title: "浏览网页时自动收录（可能会导致目录混乱）",
+      auto_capture_hint: "关闭后，浏览页面不会自动写入 RAG；仍可手动点“收录”。",
+      vec_enabled: "启用向量模型", vec_base: "Base URL", vec_model: "模型名称", vec_key: "API Key（可选）", vec_dim: "向量维度（0=自动）",
+      vec_save: "保存向量配置", vec_test: "测试", vec_saved: "已保存向量配置", vec_test_ok: "向量接口可用", vec_missing: "请先填写 Base URL 和模型名称",
       rss_title: "RSS 内容管理器（增删改查）", rss_panel_title: "RSS 内容管理器",
       refresh: "刷新", loading: "加载中…", add_sub: "添加订阅",
       kw_ph: "关键词：新订阅会立刻搜索并入 RAG", interval_title: "刷新间隔（秒）",
@@ -600,6 +605,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       hosts: "主机制 ", blocklist: "URL 黑名单 ",
       block_ph: "加入黑名单：*.tracker.net 或 *://news.example.com/*（支持 *）", block_add: "加入黑名单",
       del: "删", confirm: "确认?", delete: "删除", confirm_delete: "确认删除?",
+      prev_page: "上一页", next_page: "下一页",
       items: "条目", save_interval: "改间隔", pause: "暂停", resume: "恢复",
       clear: "清空", confirm_clear: "确认清空?", copy: "复制", copy_url: "复制地址",
       ignore: "忽略", unignore: "取消忽略", builtin: "内置"
@@ -609,6 +615,11 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       ready: "Ready", snap: "Capture", snap_title: "Manually save this page's article",
       settings: "Settings", settings_title: "Settings", ui_lang: "UI language",
       lang_hint: "Applied immediately and remembered for next launch.", close: "Close",
+      vector_title: "Vector model", vector_hint: "OpenAI/Ollama-compatible embeddings endpoints are supported. After saving, new captures write vectors; old docs are backfilled gradually.",
+      auto_capture_title: "Auto-capture while browsing (can clutter the library)",
+      auto_capture_hint: "When off, browsing pages are not saved to RAG automatically; manual Capture still works.",
+      vec_enabled: "Enable vector model", vec_base: "Base URL", vec_model: "Model name", vec_key: "API key (optional)", vec_dim: "Dimensions (0 = auto)",
+      vec_save: "Save vector config", vec_test: "Test", vec_saved: "Vector config saved", vec_test_ok: "Embedding endpoint OK", vec_missing: "Base URL and model are required",
       rss_title: "RSS content manager (CRUD)", rss_panel_title: "RSS Content Manager",
       refresh: "Refresh", loading: "Loading…", add_sub: "Add",
       kw_ph: "Keyword: new subscription searches and saves to RAG immediately", interval_title: "Refresh interval (seconds)",
@@ -617,6 +628,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       hosts: "Hosts ", blocklist: "URL blocklist ",
       block_ph: "Add block rule: *.tracker.net or *://news.example.com/* (supports *)", block_add: "Block",
       del: "Del", confirm: "Confirm?", delete: "Delete", confirm_delete: "Confirm delete?",
+      prev_page: "Prev", next_page: "Next",
       items: "Items", save_interval: "Save", pause: "Pause", resume: "Resume",
       clear: "Clear", confirm_clear: "Confirm clear?", copy: "Copy", copy_url: "Copy URL",
       ignore: "Ignore", unignore: "Unignore", builtin: "Built-in"
@@ -685,6 +697,97 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     b.appendChild(s);
     return b;
   }
+  function setVecStatus(text, color) {
+    var el = document.getElementById("c96-vector-status");
+    if (el) {
+      el.textContent = text || "";
+      el.style.color = color || "#6b7280";
+    }
+  }
+  function readEmbedForm() {
+    var on = document.getElementById("c96-vec-enabled");
+    var base = document.getElementById("c96-vec-base");
+    var model = document.getElementById("c96-vec-model");
+    var key = document.getElementById("c96-vec-key");
+    var dim = document.getElementById("c96-vec-dim");
+    return {
+      enabled: !!(on && on.checked),
+      base_url: base ? (base.value || "").trim() : "",
+      model: model ? (model.value || "").trim() : "",
+      api_key: key ? (key.value || "").trim() : "",
+      dim: dim ? Math.max(0, parseInt(dim.value || "0", 10) || 0) : 0
+    };
+  }
+  function loadEmbedSettings() {
+    var st = document.getElementById("c96-vector-status");
+    if (st) { st.textContent = L("loading"); st.style.color = "#6b7280"; }
+    try {
+      ipc("capture_auto_get", {}).then(function (on) {
+        var c = document.getElementById("c96-auto-capture");
+        if (c) { c.checked = !!on; }
+      }).catch(function () {});
+      ipc("embed_get", {}).then(function (cfg) {
+        cfg = cfg || {};
+        var on = document.getElementById("c96-vec-enabled");
+        var base = document.getElementById("c96-vec-base");
+        var model = document.getElementById("c96-vec-model");
+        var key = document.getElementById("c96-vec-key");
+        var dim = document.getElementById("c96-vec-dim");
+        if (on) { on.checked = !!cfg.enabled; }
+        if (base) { base.value = cfg.base_url || ""; }
+        if (model) { model.value = cfg.model || ""; }
+        if (key) { key.value = cfg.api_key || ""; }
+        if (dim) { dim.value = String(cfg.dim || 0); }
+        if (st) {
+          st.textContent = cfg.enabled ? L("vec_enabled") + " · " + (cfg.model || "") : "RAG = BM25";
+          st.style.color = cfg.enabled ? "#86efac" : "#9aa4b2";
+        }
+      }).catch(function (e) { if (st) { st.textContent = "读取向量配置失败: " + e; st.style.color = "#f87171"; } });
+    } catch (e) {
+      if (st) { st.textContent = "读取向量配置失败: " + e; st.style.color = "#f87171"; }
+    }
+  }
+  function saveEmbedSettings() {
+    var cfg = readEmbedForm();
+    var st = document.getElementById("c96-vector-status");
+    if (cfg.enabled && (!cfg.base_url || !cfg.model)) {
+      if (st) { st.textContent = L("vec_missing"); st.style.color = "#f87171"; }
+      return;
+    }
+    if (st) { st.textContent = L("loading"); st.style.color = "#9aa4b2"; }
+    try {
+      ipc("embed_set", cfg).then(function (o) {
+        o = o || {};
+        if (st) {
+          st.textContent = L("vec_saved") + " · vectors=" + (o.vec_docs || 0);
+          st.style.color = o.ok ? "#86efac" : "#f87171";
+        }
+      }).catch(function (e) { if (st) { st.textContent = "保存失败: " + e; st.style.color = "#f87171"; } });
+    } catch (e) {
+      if (st) { st.textContent = "保存失败: " + e; st.style.color = "#f87171"; }
+    }
+  }
+  function testEmbedSettings() {
+    var st = document.getElementById("c96-vector-status");
+    var cfg = readEmbedForm();
+    if (cfg.enabled && (!cfg.base_url || !cfg.model)) {
+      if (st) { st.textContent = L("vec_missing"); st.style.color = "#f87171"; }
+      return;
+    }
+    if (st) { st.textContent = L("loading"); st.style.color = "#9aa4b2"; }
+    try {
+      ipc("embed_set", cfg).then(function () {
+        return ipc("embed_test", {});
+      }).then(function (msg) {
+        if (st) {
+          st.textContent = String(msg || "");
+          st.style.color = String(msg || "").indexOf("OK") >= 0 ? "#86efac" : "#f87171";
+        }
+      }).catch(function (e) { if (st) { st.textContent = "测试失败: " + e; st.style.color = "#f87171"; } });
+    } catch (e) {
+      if (st) { st.textContent = "测试失败: " + e; st.style.color = "#f87171"; }
+    }
+  }
   function openSettings() {
     if (MODE === "toolbar") { post("ui", "settings"); return null; }
     var d = document.getElementById("c96-settings");
@@ -693,7 +796,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       d.id = "c96-settings";
       d.setAttribute("style", "display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;background:transparent;align-items:center;justify-content:center;font:13px/1.5 system-ui,'Segoe UI',sans-serif;");
       var card = document.createElement("div");
-      card.setAttribute("style", "width:360px;max-width:92vw;background:#14161a;color:#e6e6e6;border:1px solid #2a2e36;border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,.6);padding:16px;");
+      card.setAttribute("style", "width:420px;max-width:92vw;max-height:86vh;overflow:auto;background:#14161a;color:#e6e6e6;border:1px solid #2a2e36;border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,.6);padding:16px;box-sizing:border-box;");
       var h = document.createElement("div");
       h.className = "c96-set-title";
       h.textContent = L("settings_title");
@@ -719,6 +822,66 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       hint.className = "c96-set-hint";
       hint.textContent = L("lang_hint");
       hint.setAttribute("style", "color:#6b7280;font-size:12px;margin-top:8px;");
+      var autoRow = document.createElement("label");
+      autoRow.setAttribute("style", "display:flex;align-items:flex-start;gap:8px;margin-top:14px;cursor:pointer;");
+      var autoChk = document.createElement("input");
+      autoChk.type = "checkbox"; autoChk.id = "c96-auto-capture";
+      autoChk.setAttribute("style", "margin-top:2px;");
+      var autoText = document.createElement("span");
+      autoText.textContent = L("auto_capture_title");
+      autoRow.appendChild(autoChk); autoRow.appendChild(autoText);
+      autoChk.addEventListener("change", function () {
+        var on = !!autoChk.checked;
+        try { ipc("capture_auto_set", { enabled: on }).catch(function () {}); } catch (e) {}
+      });
+      var autoHint = document.createElement("div");
+      autoHint.textContent = L("auto_capture_hint");
+      autoHint.setAttribute("style", "color:#6b7280;font-size:12px;margin:4px 0 0 22px;");
+      var divider = document.createElement("div");
+      divider.setAttribute("style", "border-top:1px solid #2a2e36;margin:16px 0;");
+      var vh = document.createElement("div");
+      vh.textContent = L("vector_title");
+      vh.setAttribute("style", "color:#93c5fd;font-weight:700;margin-bottom:6px;");
+      var vhint = document.createElement("div");
+      vhint.textContent = L("vector_hint");
+      vhint.setAttribute("style", "color:#6b7280;font-size:12px;margin-bottom:10px;");
+      var onRow = document.createElement("label");
+      onRow.setAttribute("style", "display:flex;align-items:center;gap:8px;color:#e6e6e6;margin-bottom:8px;");
+      var on = document.createElement("input");
+      on.type = "checkbox"; on.id = "c96-vec-enabled";
+      onRow.appendChild(on);
+      var onLabel = document.createElement("span"); onLabel.textContent = L("vec_enabled"); onRow.appendChild(onLabel);
+      var mkLabel = function (text) {
+        var el = document.createElement("div");
+        el.textContent = text;
+        el.setAttribute("style", "color:#9aa4b2;font-size:12px;margin:8px 0 4px;");
+        return el;
+      };
+      var mkInput = function (id, ph) {
+        var el = document.createElement("input");
+        el.id = id; el.type = "text"; el.placeholder = ph || "";
+        el.setAttribute("style", "width:100%;height:30px;box-sizing:border-box;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 8px;font:12px system-ui;outline:none;");
+        return el;
+      };
+      var base = mkInput("c96-vec-base", "http://127.0.0.1:11434/v1");
+      var model = mkInput("c96-vec-model", "nomic-embed-text");
+      var key = mkInput("c96-vec-key", "");
+      key.type = "password";
+      var dim = mkInput("c96-vec-dim", "0");
+      var vfoot = document.createElement("div");
+      vfoot.setAttribute("style", "display:flex;gap:6px;align-items:center;margin-top:10px;");
+      var save = document.createElement("button");
+      save.type = "button"; save.textContent = L("vec_save");
+      save.setAttribute("style", "height:30px;padding:0 12px;background:#1c2027;color:#93c5fd;border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
+      save.addEventListener("click", saveEmbedSettings);
+      var test = document.createElement("button");
+      test.type = "button"; test.textContent = L("vec_test");
+      test.setAttribute("style", "height:30px;padding:0 12px;background:#1c2027;color:#86efac;border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
+      test.addEventListener("click", testEmbedSettings);
+      var vstat = document.createElement("span");
+      vstat.id = "c96-vector-status";
+      vstat.setAttribute("style", "flex:1;min-width:0;color:#6b7280;font-size:12px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
+      vfoot.appendChild(save); vfoot.appendChild(test); vfoot.appendChild(vstat);
       var foot = document.createElement("div");
       foot.setAttribute("style", "display:flex;justify-content:flex-end;margin-top:14px;");
       var close = document.createElement("button");
@@ -729,13 +892,21 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       close.addEventListener("click", function () { d.style.display = "none"; if (MODE === "overlay") { post("ui", "close"); } });
       d.addEventListener("click", function (ev) { if (ev.target === d) { d.style.display = "none"; if (MODE === "overlay") { post("ui", "close"); } } });
       foot.appendChild(close);
-      card.appendChild(h); card.appendChild(lb); card.appendChild(sel); card.appendChild(hint); card.appendChild(foot);
+      card.appendChild(h); card.appendChild(lb); card.appendChild(sel); card.appendChild(hint);
+      card.appendChild(autoRow); card.appendChild(autoHint);
+      card.appendChild(divider); card.appendChild(vh); card.appendChild(vhint); card.appendChild(onRow);
+      card.appendChild(mkLabel(L("vec_base"))); card.appendChild(base);
+      card.appendChild(mkLabel(L("vec_model"))); card.appendChild(model);
+      card.appendChild(mkLabel(L("vec_key"))); card.appendChild(key);
+      card.appendChild(mkLabel(L("vec_dim"))); card.appendChild(dim);
+      card.appendChild(vfoot); card.appendChild(foot);
       d.appendChild(card);
       (document.body || document.documentElement).appendChild(d);
     }
     d.style.display = "flex";
     var cur = document.getElementById("c96-lang-sel");
     if (cur) { cur.value = UI_LANG; }
+    loadEmbedSettings();
     return d;
   }
   function post(type, detail, extra) {
@@ -837,6 +1008,8 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     return { text: t, chars: t.length, linkRatio: 0, selector: "", mode: "raw" };
   }
   var CAP = { url: "", seq: 0, last: -1, tries: 0, stable: 0, fired: false };
+  var AUTO_CAPTURE = false;
+  var FORCE_CAPTURE = false;
   function capture() {
     var bar = document.getElementById("c96-bar");
     var status = document.getElementById("c96-status");
@@ -853,7 +1026,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
   }
   // 抢在正文渲染出来之前抓会把菜单存进去：等到「文本长度稳定」再送存，最多等 8 次。
   function tick(seq) {
-    if (seq !== CAP.seq || CAP.fired) { return; }
+    if ((!AUTO_CAPTURE && !FORCE_CAPTURE) || seq !== CAP.seq || CAP.fired) { return; }
     CAP.tries = CAP.tries + 1;
     var r = extractPage();
     var n = (typeof r.chars === "number" && r.chars >= 0) ? r.chars : (r.text || "").length;
@@ -874,7 +1047,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     setTimeout(function () { tick(seq); }, 1000);
   }
   function watchNav() {
-    if (location.href !== CAP.url) { beginCapture(); }
+    if ((AUTO_CAPTURE || FORCE_CAPTURE) && location.href !== CAP.url) { beginCapture(); }
   }
   function describe(el) {
     if (!el || !el.tagName) { return ""; }
@@ -893,6 +1066,10 @@ pub const OVERLAY_INIT: &str = r##"(function () {
   var RSS_PENDING = {};
   var RSS_SEQ = 0;
   var RSS_DQ_TIMER = 0;
+  var RSS_DOCS = [];
+  var RSS_TOTAL = 0;
+  var RSS_PAGE = 0;
+  var RSS_PAGE_SIZE = 5;
   var RSS_OP = { topic_query: "topic_add", topic_list: "topics", rss_sources: "sources", rss_base: "base", topic_docs: "topic_docs", topic_run: "topic_run", topic_remove: "topic_remove", topic_update: "topic_update", rss_doc_remove: "doc_remove" };
   function rssReply(id, ok, data) {
     var p = RSS_PENDING[id];
@@ -1057,13 +1234,22 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     });
     dCtl.appendChild(dq);
     dCtl.appendChild(dunsub);
+    var dPage = document.createElement("div");
+    dPage.id = "c96-rss-docs-page";
+    dPage.setAttribute("style", "display:flex;align-items:center;gap:6px;margin:4px 0;color:#9aa4b2;font-size:12px;");
     var dList = document.createElement("div");
     dList.id = "c96-rss-docs";
     dList.textContent = L("loading");
     // 主机制：按站点清空 / 忽略（忽略后不再自动收录）
     var hTitle = document.createElement("div");
-    hTitle.setAttribute("style", "color:#93c5fd;margin:12px 0 4px;");
-    hTitle.textContent = L("hosts");
+    hTitle.setAttribute("style", "color:#93c5fd;margin:12px 0 4px;cursor:pointer;user-select:none;");
+    var hCaret = document.createElement("span");
+    hCaret.id = "c96-rss-hcaret";
+    hCaret.textContent = "▸ ";
+    hTitle.appendChild(hCaret);
+    var hLabel = document.createElement("span");
+    hLabel.textContent = L("hosts");
+    hTitle.appendChild(hLabel);
     var hCount = document.createElement("span");
     hCount.id = "c96-rss-hcount";
     hCount.setAttribute("style", "color:#9aa4b2;font-size:12px;");
@@ -1071,16 +1257,28 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     var hList = document.createElement("div");
     hList.id = "c96-rss-hosts";
     hList.textContent = L("loading");
+    hList.style.display = "none";
+    hTitle.addEventListener("click", function () {
+      var open = hList.style.display === "none";
+      hList.style.display = open ? "block" : "none";
+      hCaret.textContent = open ? "▾ " : "▸ ";
+    });
     // 黑名单：内置搜索引擎结果页规则 + 用户自加 glob（含此 URL 的页面不再自动收录）
     var bTitle = document.createElement("div");
-    bTitle.setAttribute("style", "color:#93c5fd;margin:12px 0 4px;");
-    bTitle.textContent = L("blocklist");
+    bTitle.setAttribute("style", "color:#93c5fd;margin:12px 0 4px;cursor:pointer;user-select:none;");
+    var bCaret = document.createElement("span");
+    bCaret.id = "c96-rss-bcaret";
+    bCaret.textContent = "▸ ";
+    bTitle.appendChild(bCaret);
+    var bLabel = document.createElement("span");
+    bLabel.textContent = L("blocklist");
+    bTitle.appendChild(bLabel);
     var bCount = document.createElement("span");
     bCount.id = "c96-rss-bcount";
     bCount.setAttribute("style", "color:#9aa4b2;font-size:12px;");
     bTitle.appendChild(bCount);
     var bAddBox = document.createElement("div");
-    bAddBox.setAttribute("style", "display:flex;gap:6px;margin:2px 0 4px;");
+    bAddBox.setAttribute("style", "display:none;gap:6px;margin:2px 0 4px;");
     var bp = document.createElement("input");
     bp.id = "c96-rss-bpat";
     bp.placeholder = L("block_ph");
@@ -1100,6 +1298,13 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     var bList = document.createElement("div");
     bList.id = "c96-rss-block";
     bList.textContent = L("loading");
+    bList.style.display = "none";
+    bTitle.addEventListener("click", function () {
+      var open = bAddBox.style.display === "none";
+      bAddBox.style.display = open ? "flex" : "none";
+      bList.style.display = open ? "block" : "none";
+      bCaret.textContent = open ? "▾ " : "▸ ";
+    });
     p.appendChild(head);
     p.appendChild(urls);
     p.appendChild(addBox);
@@ -1107,6 +1312,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     p.appendChild(tList);
     p.appendChild(dTitle);
     p.appendChild(dCtl);
+    p.appendChild(dPage);
     p.appendChild(dList);
     p.appendChild(hTitle);
     p.appendChild(hList);
@@ -1328,24 +1534,64 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     line.appendChild(del);
     return line;
   }
-  function renderRssDocs(o) {
+  function renderDocsPager() {
+    var pg = document.getElementById("c96-rss-docs-page");
+    if (!pg) { return; }
+    pg.textContent = "";
+    if (RSS_DOCS.length <= RSS_PAGE_SIZE) { return; }
+    var totalPages = Math.ceil(RSS_DOCS.length / RSS_PAGE_SIZE);
+    var prev = rssBtnNew(L("prev_page"), null, "#93c5fd");
+    prev.disabled = RSS_PAGE <= 0;
+    prev.style.opacity = prev.disabled ? ".45" : "1";
+    prev.addEventListener("click", function () {
+      if (RSS_PAGE > 0) { RSS_PAGE--; renderRssDocs({ rows: RSS_DOCS, total: RSS_TOTAL }, false); }
+    });
+    var info = document.createElement("span");
+    var first = RSS_PAGE * RSS_PAGE_SIZE + 1;
+    var last = Math.min(RSS_DOCS.length, (RSS_PAGE + 1) * RSS_PAGE_SIZE);
+    info.textContent = UI_LANG === "en"
+      ? ("Page " + (RSS_PAGE + 1) + " / " + totalPages + " · showing " + first + "-" + last + " / " + RSS_DOCS.length)
+      : ("第 " + (RSS_PAGE + 1) + " / " + totalPages + " 页 · 显示 " + first + "-" + last + " / " + RSS_DOCS.length);
+    var next = rssBtnNew(L("next_page"), null, "#93c5fd");
+    next.disabled = RSS_PAGE >= totalPages - 1;
+    next.style.opacity = next.disabled ? ".45" : "1";
+    next.addEventListener("click", function () {
+      if (RSS_PAGE < totalPages - 1) { RSS_PAGE++; renderRssDocs({ rows: RSS_DOCS, total: RSS_TOTAL }, false); }
+    });
+    pg.appendChild(prev);
+    pg.appendChild(info);
+    pg.appendChild(next);
+  }
+  function renderRssDocs(o, reset) {
     var el = document.getElementById("c96-rss-docs");
     var cnt = document.getElementById("c96-rss-dcount");
     if (!el) { return; }
     var rows = (o && o.rows) ? o.rows : [];
     var total = (o && o.total !== undefined) ? o.total : 0;
+    RSS_DOCS = rows;
+    RSS_TOTAL = total;
+    if (reset) { RSS_PAGE = 0; }
+    var maxPage = Math.max(0, Math.ceil(RSS_DOCS.length / RSS_PAGE_SIZE) - 1);
+    if (RSS_PAGE > maxPage) { RSS_PAGE = maxPage; }
+    var start = RSS_PAGE * RSS_PAGE_SIZE;
+    var end = Math.min(RSS_DOCS.length, start + RSS_PAGE_SIZE);
     el.textContent = "";
     var mode = rssOnlyUnsub() ? " · 只看随手" : "";
-    if (cnt) { cnt.textContent = "(库中 " + total + " 条 · 显示 " + rows.length + " 条" + mode + ")"; }
-    if (rows.length === 0) { el.textContent = "（没有匹配内容：换个过滤词，或点「显示全部」）"; return; }
-    for (var i = 0; i < rows.length; i++) { el.appendChild(rssAnyLine(rows[i])); }
+    if (cnt) { cnt.textContent = "(库中 " + total + " 条 · 显示 " + RSS_DOCS.length + " 条" + mode + ")"; }
+    if (RSS_DOCS.length === 0) {
+      el.textContent = "（没有匹配内容：换个过滤词，或点「显示全部」）";
+      renderDocsPager();
+      return;
+    }
+    for (var i = start; i < end; i++) { el.appendChild(rssAnyLine(RSS_DOCS[i])); }
+    renderDocsPager();
   }
   function reloadDocs() {
     var el = document.getElementById("c96-rss-docs");
     if (!el) { return Promise.resolve(); }
     el.textContent = L("loading");
     return ipc("docs", { filter: rssFilter(), only_unsub: rssOnlyUnsub(), limit: 300 })
-      .then(function (o) { renderRssDocs(o); })
+      .then(function (o) { renderRssDocs(o, true); })
       .catch(function (e) { el.textContent = "读取失败：" + e; });
   }
   function rssHostRow(r) {
@@ -1498,7 +1744,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       renderRssTopics(ts);
       renderRssSources(res[1] || []);
       renderRssHosts(res[2] || []);
-      renderRssDocs(res[3] || {});
+      renderRssDocs(res[3] || {}, true);
       renderPatterns(res[4] || {});
       var bad = (res[0] && res[0].err) ? " · IPC 错误: " + res[0].err : "";
       var shown = (res[3] && res[3].shown !== undefined) ? res[3].shown : 0;
@@ -1624,7 +1870,31 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       setTimeout(syncLang, 1200);
     } else if (MODE === "content") {
       window.__C96_CAPTURE__ = capture;
-      beginCapture();
+      window.__C96_SET_FORCE_CAPTURE__ = function (on) {
+        var next = !!on;
+        if (next && !FORCE_CAPTURE) {
+          FORCE_CAPTURE = true;
+          beginCapture();
+        } else if (!next) {
+          FORCE_CAPTURE = false;
+        }
+      };
+      AUTO_CAPTURE = false;
+      try {
+        ipc("capture_auto_get", {}).then(function (on) {
+          AUTO_CAPTURE = !!on;
+          if (AUTO_CAPTURE) { beginCapture(); }
+        }).catch(function () {});
+      } catch (e) {}
+      setInterval(function () {
+        try {
+          ipc("capture_auto_get", {}).then(function (on) {
+            var next = !!on;
+            if (next && !AUTO_CAPTURE) { beginCapture(); }
+            AUTO_CAPTURE = next;
+          }).catch(function () {});
+        } catch (e) {}
+      }, 3000);
       setInterval(watchNav, 1500);
     }
   }
@@ -1795,6 +2065,8 @@ pub fn crawl(app: &AppHandle, urls: &[String], query: &str) -> CrawlReport {
     ui_mask(app, "自动操作中，请勿操作控件，会导致中断");
     let n = urls.len();
     let mut rep = CrawlReport { stored: 0, skipped: 0, failed: 0 };
+    let force_on = "window.__C96_SET_FORCE_CAPTURE__&&window.__C96_SET_FORCE_CAPTURE__(true);";
+    let force_off = "window.__C96_SET_FORCE_CAPTURE__&&window.__C96_SET_FORCE_CAPTURE__(false);";
     for (i, url) in urls.iter().enumerate() {
         let host = host_of(url);
         ui_mask(app, &format!("自动操作中 {}/{}：{} · 请勿操作控件，会导致中断", i + 1, n, host));
@@ -1804,6 +2076,7 @@ pub fn crawl(app: &AppHandle, urls: &[String], query: &str) -> CrawlReport {
         let mut done = false;
         while t0.elapsed() < std::time::Duration::from_secs(25) {
             std::thread::sleep(std::time::Duration::from_millis(600));
+            let _ = eval_string(app, "main", force_on);
             for e in list_events().iter().rev() {
                 if e.seq > base && e.kind.starts_with("store") && e.url.to_lowercase().contains(&host) {
                     if e.kind == "store" { rep.stored += 1; }
@@ -1817,6 +2090,7 @@ pub fn crawl(app: &AppHandle, urls: &[String], query: &str) -> CrawlReport {
         }
         if !done { rep.failed += 1; }
     }
+    let _ = eval_string(app, "main", force_off);
     ui_mask_hide(app);
     return rep;
 }

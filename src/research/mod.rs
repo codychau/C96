@@ -8,6 +8,7 @@
 //!
 //! 与 store/kb 的分工：kb 管"怎么存、怎么过期"；这里管"什么时候搜、搜完拿什么回答"。
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -205,32 +206,69 @@ pub fn relevance(title: &str, text: &str, feats: &[String]) -> usize {
     return score;
 }
 
-/// RAG 检索：走阶段 G 的 BM25 索引（F 的 store.search 是整串子串匹配，
-/// 对"卡普空最新游戏"这种短语会 0 命中）。score = BM25 × 100 的整数近似。
+/// RAG 检索：阶段 G BM25 为主，阶段 H 向量模型已配置时做 cosine 融合。
 pub fn retrieve(store: &mut Store, query: &str, limit: usize) -> Vec<KbHit> {
     let feats = query_features(query);
-    if feats.is_empty() { return store.search(query, limit); }
-    let needle: String = feats[0].clone();
-    let idx = store.search_index();
-    let hits = idx.search(query, limit.saturating_mul(2).max(limit));
-    let mut out: Vec<KbHit> = Vec::new();
-    for h in &hits {
-        let score = (h.score * 100.0).round() as usize;
-        if score == 0 { continue; }
-        let d = idx.doc(h.doc);
-        out.push(KbHit {
-            url: d.url.clone(),
-            title: d.title.clone(),
-            host: d.host.clone(),
-            source: d.source.clone(),
-            score: score,
-            snippet: make_snippet(&d.text, &needle, 160),
-            stored_at_ms: d.stored_at_ms,
-        });
-        if out.len() >= limit { break; }
+    let want = limit.saturating_mul(2).max(limit).max(8);
+    let mut by_url: HashMap<String, KbHit> = HashMap::new();
+    if feats.is_empty() {
+        for h in store.search(query, want) {
+            by_url.insert(h.url.clone(), h);
+        }
+    } else {
+        let needle: String = feats[0].clone();
+        let bm25 = {
+            let idx = store.search_index();
+            idx.search(query, want)
+        };
+        for h in &bm25 {
+            let score = (h.score * 100.0).round() as usize;
+            if score == 0 { continue; }
+            let d = store.search_index().doc(h.doc);
+            let hit = KbHit {
+                url: d.url.clone(),
+                title: d.title.clone(),
+                host: d.host.clone(),
+                source: d.source.clone(),
+                score: score,
+                snippet: make_snippet(&d.text, &needle, 160),
+                stored_at_ms: d.stored_at_ms,
+            };
+            by_url.insert(hit.url.clone(), hit);
+        }
     }
+    let vec_hits = store.vector_candidates(query, limit.saturating_mul(3).max(20));
+    let mut out: Vec<KbHit> = by_url.into_values().collect();
+    if !vec_hits.is_empty() {
+        for (d, vs) in vec_hits {
+            if vs <= 0.03 { continue; }
+            let vscore = (vs * 10000.0).round() as usize;
+            let mut merged = false;
+            for h in out.iter_mut() {
+                if h.url == d.url {
+                    h.score = h.score.saturating_add(vscore);
+                    merged = true;
+                    break;
+                }
+            }
+            if !merged {
+                out.push(KbHit {
+                    url: d.url.clone(),
+                    title: d.title.clone(),
+                    host: d.host.clone(),
+                    source: d.source.clone(),
+                    score: vscore,
+                    snippet: make_snippet(&d.text, &feats.first().cloned().unwrap_or_else(|| query.to_string()), 160),
+                    stored_at_ms: d.stored_at_ms,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.stored_at_ms.cmp(&a.stored_at_ms)));
+    out.truncate(limit);
     return out;
 }
+
 
 // ------------------------------------------------------------ 任务清单 ----
 

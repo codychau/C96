@@ -246,6 +246,8 @@ fn cmd_stats(parsed: &Parsed) -> i32 {
     println!("  ttl_days:       {}", st.ttl_days);
     println!("  purged (open):  {}", st.purged);
     println!("  state entries:  {} ({})", st.state_entries, s.state_path());
+    println!("  vectors:        {} ({})", st.vec_docs, s.vec_path());
+    if !st.embed_model.is_empty() { println!("  embed model:    {} ({})", st.embed_model, if st.embed_enabled { "on" } else { "off" }); }
     return 0;
 }
 

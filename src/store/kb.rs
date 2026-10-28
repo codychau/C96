@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use crate::fetch::feed::site_of;
+use crate::embed;
+use crate::embed::VecDoc;
 use crate::index::Index;
 use crate::search::normalize::normalize_url;
 use crate::store::doc::now_ms;
@@ -43,6 +45,9 @@ pub struct StoreStats {
     pub ttl_days: u64,
     pub purged: usize,
     pub state_entries: usize,
+    pub vec_docs: usize,
+    pub embed_model: String,
+    pub embed_enabled: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -68,6 +73,9 @@ pub struct Store {
     purged: usize,
     /// 阶段 G：惰性 BM25 索引缓存（save / purge / 回拨后失效）
     idx: Option<Index>,
+    /// 阶段 H：向量 sidecar 文件 + 当前内存向量（按 doc hash）
+    vec_path: PathBuf,
+    vecs: HashMap<String, VecDoc>,
     /// 阶段 I：磁盘指纹（kb + state 的 mtime/len），服务器据此发现外部进程写入
     file_key: u64,
 }
@@ -117,6 +125,7 @@ impl Store {
     pub fn open(path: &Path, ttl_days: u64) -> Result<Store, String> {
         let ttl = if ttl_days == 0 { DEFAULT_TTL_DAYS } else { ttl_days };
         let sp = default_state_path(path);
+        let vp = embed::path_for(path);
         let mut s = Store {
             path: path.to_path_buf(),
             state_path: sp.clone(),
@@ -128,6 +137,8 @@ impl Store {
             state: state::load(&sp.to_string_lossy().to_string()),
             purged: 0,
             idx: None,
+            vec_path: vp.clone(),
+            vecs: embed::load(&vp),
             file_key: 0,
         };
         for line in jsonl::read_lines(&s.path) {
@@ -136,14 +147,17 @@ impl Store {
             }
         }
         s.purged = s.purge();
-        s.file_key = Store::disk_key(&s.path, &s.state_path);
+        let vec_before = s.vecs.len();
+        s.vecs.retain(|h, _| s.seen.contains(h));
+        if s.vecs.len() != vec_before { let _ = embed::rewrite(&s.vec_path, &s.vecs); }
+        s.file_key = Store::disk_key(&s.path, &s.state_path, &s.vec_path);
         return Ok(s);
     }
 
-    /// kb + state 文件的 mtime/len 指纹。
-    fn disk_key(path: &Path, state_path: &Path) -> u64 {
+    /// kb + state + vector 文件的 mtime/len 指纹。
+    fn disk_key(path: &Path, state_path: &Path, vec_path: &Path) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
-        for p in [path, state_path] {
+        for p in [path, state_path, vec_path] {
             let (mt, len) = match fs::metadata(p) {
                 Ok(m) => {
                     let mt = m.modified().ok()
@@ -163,7 +177,7 @@ impl Store {
     /// 阶段 I：其他进程写入后按需重载（常驻 RSS 服务器必须看到外部新增）。
     /// 返回 true = 确实重载了。开销 = 2 次 stat。
     pub fn reload_if_changed(&mut self) -> bool {
-        let k = Store::disk_key(&self.path, &self.state_path);
+        let k = Store::disk_key(&self.path, &self.state_path, &self.vec_path);
         if k == self.file_key { return false; }
         match Store::open(&self.path, self.ttl_days) {
             Ok(fresh) => { *self = fresh; return true; }
@@ -254,7 +268,17 @@ impl Store {
         };
         let line = serde_json::to_string(&doc).map_err(|e| e.to_string())?;
         jsonl::append_line(&self.path, &line)?;
-        let msg = format!("stored: {} ({} chars, host={}, source={})", hash, doc.text_len, doc.host, doc.source);
+        let mut extra = String::new();
+        if self.embed_enabled() {
+            match self.embed_and_store(&doc) {
+                Ok(()) => extra = " +vector".to_string(),
+                Err(e) => {
+                    println!("[c96 embed] skip {}: {}", doc.hash, e);
+                    extra = format!(" [vector-skip: {}]", e);
+                }
+            }
+        }
+        let msg = format!("stored: {} ({} chars, host={}, source={}){}", hash, doc.text_len, doc.host, doc.source, extra);
         self.index(doc);
         self.idx = None;
         return Ok(msg);
@@ -299,6 +323,7 @@ impl Store {
         self.rewrite_docs(&self.docs)?;
         self.rebuild();
         self.idx = None;
+        self.reembed_doc(&self.docs[idx].clone());
         return Ok(format!("replaced: {} ({} -> {} chars, mode {} -> {})", hash, old.text_len, chars,
             if old.mode.is_empty() { "raw" } else { old.mode.as_str() },
             if mode.is_empty() { "raw" } else { mode }));
@@ -335,6 +360,7 @@ impl Store {
                 self.docs = keep;
                 self.rebuild();
                 self.idx = None;
+                self.filter_vectors_to_docs();
                 self.purged = dropped;
                 self.state.last_purge_ms = now;
                 self.state.ttl_days = self.ttl_days;
@@ -361,6 +387,7 @@ impl Store {
                 self.docs = keep;
                 self.rebuild();
                 self.idx = None;
+                self.filter_vectors_to_docs();
                 return true;
             }
             Err(_) => { return false; }
@@ -381,6 +408,7 @@ impl Store {
                 self.docs = keep;
                 self.rebuild();
                 self.idx = None;
+                self.filter_vectors_to_docs();
                 return dropped;
             }
             Err(_) => { return 0; }
@@ -432,6 +460,9 @@ impl Store {
             ttl_days: self.ttl_days,
             purged: self.purged,
             state_entries: self.state.entries.len(),
+            vec_docs: self.vec_count_for_model(),
+            embed_model: self.state.embed.model.clone(),
+            embed_enabled: self.embed_enabled(),
         };
     }
 
@@ -442,6 +473,140 @@ impl Store {
     /// 可变状态（主题任务写入用）。改完记得 persist_state()。
     pub fn state_mut(&mut self) -> &mut StoreState {
         return &mut self.state;
+    }
+
+    /// 阶段 H：当前向量配置（来自 kb.state.toml 的 [embed]）。
+    pub fn embed_config(&self) -> state::EmbedConfig {
+        return self.state.embed.clone();
+    }
+
+    pub fn set_embed_config(&mut self, cfg: state::EmbedConfig) -> bool {
+        self.state.embed = cfg;
+        return self.persist_state();
+    }
+
+    fn embed_enabled(&self) -> bool {
+        let e = &self.state.embed;
+        return e.enabled && !e.model.trim().is_empty() && !e.base_url.trim().is_empty();
+    }
+
+    pub fn vec_path(&self) -> String {
+        return self.vec_path.to_string_lossy().to_string();
+    }
+
+    pub fn vec_count(&self) -> usize {
+        return self.vecs.len();
+    }
+
+    pub fn vec_count_for_model(&self) -> usize {
+        if !self.embed_enabled() { return 0; }
+        let model = self.state.embed.model.trim();
+        return self.vecs.values().filter(|v| v.model == model).count();
+    }
+
+    fn embed_input_for(d: &KbDoc) -> String {
+        if d.title.trim().is_empty() {
+            return d.text.clone();
+        }
+        return d.title.clone() + "\n" + &d.text;
+    }
+
+    fn persist_vectors(&mut self) -> Result<(), String> {
+        return embed::rewrite(&self.vec_path, &self.vecs);
+    }
+
+    /// 尝试用当前向量模型给一条新入库文档生成向量。失败不影响正文入库。
+    pub fn embed_and_store(&mut self, d: &KbDoc) -> Result<(), String> {
+        if !self.embed_enabled() { return Ok(()); }
+        let cfg = self.embed_config();
+        let input = Store::embed_input_for(d);
+        let v = embed::embed(&cfg, &input)?;
+        let vd = VecDoc {
+            v: embed::VEC_SCHEMA_VERSION,
+            hash: d.hash.clone(),
+            model: cfg.model.trim().to_string(),
+            dim: v.len(),
+            text_hash: d.simhash,
+            stored_at_ms: now_ms(),
+            vec: v,
+        };
+        let _ = embed::append(&self.vec_path, &vd);
+        self.vecs.insert(vd.hash.clone(), vd);
+        return Ok(());
+    }
+
+    fn remove_vectors(&mut self, hashes: &HashSet<String>) -> bool {
+        let before = self.vecs.len();
+        if hashes.is_empty() { return false; }
+        self.vecs.retain(|h, _| !hashes.contains(h));
+        if self.vecs.len() == before { return false; }
+        let _ = self.persist_vectors();
+        return true;
+    }
+
+    fn filter_vectors_to_docs(&mut self) {
+        let before = self.vecs.len();
+        self.vecs.retain(|h, _| self.seen.contains(h));
+        if self.vecs.len() != before { let _ = self.persist_vectors(); }
+    }
+
+    /// 给 save_refresh 使用：正文变化后重算当前文档向量。
+    fn reembed_doc(&mut self, d: &KbDoc) {
+        if !self.embed_enabled() { return; }
+        let mut one: HashSet<String> = HashSet::new();
+        one.insert(d.hash.clone());
+        self.remove_vectors(&one);
+        if let Err(e) = self.embed_and_store(d) {
+            println!("[c96 embed] re-embed skip {}: {}", d.hash, e);
+        }
+    }
+
+    /// 给未入库向量的历史文档补向量（每次最多 limit 条，避免一次网络风暴）。
+    pub fn backfill_vectors(&mut self, limit: usize) -> usize {
+        if !self.embed_enabled() || limit == 0 { return 0; }
+        let model = self.state.embed.model.trim().to_string();
+        let candidates: Vec<KbDoc> = self.docs.iter().rev().filter(|d| {
+            match self.vecs.get(&d.hash) {
+                Some(v) => !(v.model == model && v.text_hash == d.simhash && v.vec.len() > 0),
+                None => true,
+            }
+        }).take(limit).cloned().collect();
+        let mut done = 0usize;
+        for owned in candidates {
+            if self.embed_and_store(&owned).is_ok() { done += 1; }
+        }
+        return done;
+    }
+
+    /// 当前模型下的向量候选（按 cosine 降序）。
+    pub fn vector_candidates(&mut self, query: &str, limit: usize) -> Vec<(KbDoc, f32)> {
+        if !self.embed_enabled() || limit == 0 || query.trim().is_empty() { return Vec::new(); }
+        let cfg = self.embed_config();
+        let model = cfg.model.trim().to_string();
+        if self.vecs.values().filter(|v| v.model == model).count() == 0 { return Vec::new(); }
+        let qv = match embed::embed(&cfg, query) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("[c96 embed] query skip: {}", e);
+                return Vec::new();
+            }
+        };
+        let mut candidates: Vec<(String, f32)> = Vec::new();
+        for (hash, v) in self.vecs.iter() {
+            if v.model != model || v.vec.is_empty() { continue; }
+            let s = embed::cosine(&qv, &v.vec);
+            if s <= 0.0 { continue; }
+            candidates.push((hash.clone(), s));
+        }
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(limit);
+        let mut out: Vec<(KbDoc, f32)> = Vec::new();
+        for (hash, score) in candidates {
+            if let Some(d) = self.docs.iter().find(|x| x.hash == hash) {
+                out.push((d.clone(), score));
+            }
+        }
+        return out;
     }
 
     /// 阶段 G：惰性构建 / 复用 BM25 索引（save / purge / 回拨会置空重建）。

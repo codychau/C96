@@ -4,6 +4,7 @@
 //! 保证两条入库路径（GUI 浏览器、HTTP 客户端）写同一个知识库文件。
 
 pub mod config;
+pub mod embed;
 pub mod fetch;
 pub mod index;
 pub mod research;

@@ -53,6 +53,16 @@ pub struct Topic {
     pub docs: Vec<String>,
 }
 
+/// 向量模型配置（阶段 H）：配置后，RAG 入库会调用兼容 embeddings 接口生成向量并写入 sidecar。
+#[derive(Clone)]
+pub struct EmbedConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub dim: usize,
+}
+
 #[derive(Clone)]
 pub struct StoreState {
     pub version: u64,
@@ -65,6 +75,10 @@ pub struct StoreState {
     /// URL 黑名单 glob（含 '/' 或 '://' 时匹配整条 URL，否则匹配 host）。
     /// 内置搜索引擎结果页规则 + 用户自加规则，命中则自动收录跳过（防杂乱）。
     pub blocked_patterns: Vec<String>,
+    /// 浏览网页时自动收录（手动“收录”不受影响）。
+    pub auto_capture: bool,
+    /// 向量模型配置（RAG embedding 存储 / 检索）。
+    pub embed: EmbedConfig,
 }
 
 /// 最多保留的主题任务数（超出丢弃 next_due 最早的）。
@@ -92,8 +106,28 @@ pub fn default_topic() -> Topic {
     };
 }
 
+pub fn default_embed() -> EmbedConfig {
+    return EmbedConfig {
+        enabled: false,
+        base_url: "http://127.0.0.1:11434/v1".to_string(),
+        api_key: String::new(),
+        model: String::new(),
+        dim: 0,
+    };
+}
+
 pub fn default_state() -> StoreState {
-    return StoreState { version: 1, ttl_days: 30, last_purge_ms: 0, entries: Vec::new(), topics: Vec::new(), ignored_hosts: Vec::new(), blocked_patterns: Vec::new() };
+    return StoreState {
+        version: 1,
+        ttl_days: 30,
+        last_purge_ms: 0,
+        entries: Vec::new(),
+        topics: Vec::new(),
+        ignored_hosts: Vec::new(),
+        blocked_patterns: Vec::new(),
+        auto_capture: false,
+        embed: default_embed(),
+    };
 }
 
 /// 内置搜索引擎结果页黑名单（glob 匹配整条 URL）：导航页 / SERP 不自动收录，防止杂乱。
@@ -237,6 +271,7 @@ pub fn load(path: &str) -> StoreState {
                 if k == "version" { st.version = int_of(&v); }
                 if k == "ttl_days" { st.ttl_days = int_of(&v); }
                 if k == "last_purge_ms" { st.last_purge_ms = int_of(&v); }
+                if k == "auto_capture" { st.auto_capture = int_of(&v) != 0; }
                 if k == "ignored_hosts" {
                     if let Value::Arr(items) = &v {
                         for it in items {
@@ -257,6 +292,17 @@ pub fn load(path: &str) -> StoreState {
                         }
                     }
                 }
+            }
+            continue;
+        }
+        if t.name == "embed" && !t.array {
+            for pair in t.keys {
+                let (k, v) = pair;
+                if k == "enabled" { st.embed.enabled = int_of(&v) != 0; }
+                if k == "base_url" { st.embed.base_url = str_of(&v); }
+                if k == "api_key" { st.embed.api_key = str_of(&v); }
+                if k == "model" { st.embed.model = str_of(&v); }
+                if k == "dim" { st.embed.dim = int_of(&v) as usize; }
             }
             continue;
         }
@@ -339,6 +385,7 @@ pub fn save(path: &str, st: &StoreState) -> bool {
     meta.push(("version".to_string(), Value::Int(st.version as i64)));
     meta.push(("ttl_days".to_string(), Value::Int(st.ttl_days as i64)));
     meta.push(("last_purge_ms".to_string(), Value::Int(st.last_purge_ms as i64)));
+    meta.push(("auto_capture".to_string(), Value::Int(if st.auto_capture { 1 } else { 0 })));
     let mut seen: Vec<Value> = Vec::new();
     for e in &st.entries {
         if !e.kb_hash.is_empty() { seen.push(Value::Str(e.kb_hash.clone())); }
@@ -351,6 +398,14 @@ pub fn save(path: &str, st: &StoreState) -> bool {
     for p in &st.blocked_patterns { blk.push(Value::Str(p.clone())); }
     meta.push(("blocked_patterns".to_string(), Value::Arr(blk)));
     text = text + &render_block("meta", false, meta);
+    text += "\n";
+    let mut emb: Vec<(String, Value)> = Vec::new();
+    emb.push(("enabled".to_string(), Value::Int(if st.embed.enabled { 1 } else { 0 })));
+    emb.push(("base_url".to_string(), Value::Str(st.embed.base_url.clone())));
+    emb.push(("api_key".to_string(), Value::Str(st.embed.api_key.clone())));
+    emb.push(("model".to_string(), Value::Str(st.embed.model.clone())));
+    emb.push(("dim".to_string(), Value::Int(st.embed.dim as i64)));
+    text = text + &render_block("embed", false, emb);
     text += "\n";
     for e in &st.entries {
         let mut keys: Vec<(String, Value)> = Vec::new();
