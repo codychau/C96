@@ -691,7 +691,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     if (!d) {
       d = document.createElement("div");
       d.id = "c96-settings";
-      d.setAttribute("style", "display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;background:rgba(0,0,0,.55);align-items:center;justify-content:center;font:13px/1.5 system-ui,'Segoe UI',sans-serif;");
+      d.setAttribute("style", "display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;background:transparent;align-items:center;justify-content:center;font:13px/1.5 system-ui,'Segoe UI',sans-serif;");
       var card = document.createElement("div");
       card.setAttribute("style", "width:360px;max-width:92vw;background:#14161a;color:#e6e6e6;border:1px solid #2a2e36;border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,.6);padding:16px;");
       var h = document.createElement("div");
@@ -1537,6 +1537,14 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     reply: rssReply,
     post: post
   };
+  function setShellBg(opaque) {
+    var bg = opaque ? "#14161a" : "transparent";
+    if (document.documentElement) { document.documentElement.style.background = bg; }
+    if (document.body) { document.body.style.background = bg; }
+  }
+  function setShellClick(on) {
+    if (document.body) { document.body.style.pointerEvents = on ? "auto" : "none"; }
+  }
   function maskShow(text) {
     var m = document.getElementById("c96-mask");
     if (!m) {
@@ -1549,6 +1557,8 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       m.appendChild(t);
       (document.body || document.documentElement).appendChild(m);
     }
+    setShellBg(true);
+    setShellClick(true);
     m.style.display = "flex";
     var tx = document.getElementById("c96-mask-text");
     if (tx) { tx.textContent = text || ""; }
@@ -1556,6 +1566,8 @@ pub const OVERLAY_INIT: &str = r##"(function () {
   function maskHide() {
     var m = document.getElementById("c96-mask");
     if (m) { m.style.display = "none"; }
+    setShellBg(false);
+    setShellClick(false);
   }
   window.__C96_UI__ = {
     panel: function () {
@@ -1564,7 +1576,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       if (d) { d.style.display = "none"; }
       installRssPanel();
       var p = document.getElementById("c96-rss-panel");
-      if (p) { p.style.display = "block"; p.style.maxHeight = "calc(100vh - 74px)"; }
+      if (p) { p.style.display = "block"; p.style.maxHeight = "calc(100vh - 74px)"; p.style.pointerEvents = "auto"; }
       return reloadRss();
     },
     settings: function () {
@@ -1572,7 +1584,8 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       var p = document.getElementById("c96-rss-panel");
       if (p) { p.style.display = "none"; }
       var d = openSettings();
-      if (d) { d.style.display = "flex"; }
+      if (d) { d.style.display = "flex"; d.style.pointerEvents = "auto"; }
+      setShellClick(true);
     },
     mask: function (t) {
       var p = document.getElementById("c96-rss-panel");
@@ -1605,8 +1618,8 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       syncLang();
       setTimeout(syncLang, 1200);
     } else if (MODE === "overlay") {
-      document.documentElement.style.background = "#14161a";
-      if (document.body) { document.body.style.background = "#14161a"; }
+      setShellBg(false);
+      setShellClick(false);
       syncLang();
       setTimeout(syncLang, 1200);
     } else if (MODE === "content") {
@@ -1716,6 +1729,7 @@ pub fn open_main(app: &AppHandle, start_url: &str, visible: bool, small: bool) -
                 .initialization_script("window.__C96_MODE__='overlay';")
                 .initialization_script(OVERLAY_INIT)
                 .additional_browser_args(BROWSER_ARGS)
+                .transparent(true)
                 .auto_resize()
                 .focused(false),
             LogicalPosition::new(0.0, 0.0),
