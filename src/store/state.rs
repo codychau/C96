@@ -92,7 +92,7 @@ pub fn default_topic() -> Topic {
         site: String::new(),
         max: 20,
         fetch_n: 5,
-        interval_secs: 1800,
+        interval_secs: 10800,
         fresh_secs: 21600,
         created_ms: 0,
         last_run_ms: 0,

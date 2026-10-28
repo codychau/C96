@@ -84,7 +84,7 @@ fn usage() {
     println!();
     println!("research / topics (I):");
     println!("  research --query Q [--engine auto|bing|baidu] [--max N] [--fetch N]");
-    println!("  --interval SECS       refresh interval, default 1800 (30 min)");
+    println!("  --interval SECS       refresh interval, default 10800 (180 min)");
     println!("  --fresh SECS          serve from RAG within this window, default 21600 (6 h)");
     println!("  --json / --cache-only / --watch [--tick SECS]");
     println!("  topics list|show|run|pause|resume|rm|due  — 任务清单（持久化在 <kb>.state.toml 的 [[topic]]）");

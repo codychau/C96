@@ -36,7 +36,7 @@ use crate::store::state;
 use crate::store::state::default_topic;
 use crate::store::state::Topic;
 
-pub const DEFAULT_INTERVAL_SECS: u64 = 1800;   // 30 min
+pub const DEFAULT_INTERVAL_SECS: u64 = 10800;  // 180 min
 pub const DEFAULT_FRESH_SECS: u64 = 6 * 3600;  // 6 h
 pub const DEFAULT_MAX: usize = 20;
 // 每轮进网页抽正文的候选数（相关性排序后取前 N）；抓不到的退化为 SERP 片段。

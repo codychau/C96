@@ -13,6 +13,7 @@
 //! 事件走 WebView2 原生 postMessage（不依赖 Tauri IPC 的远端 origin 策略），
 //! 便于 E3 回传「终态 DOM 抽取」的大结构化体。
 
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
@@ -66,8 +67,25 @@ pub fn current_query() -> String {
     return g.clone();
 }
 
-/// 覆盖层当前模式：0 隐藏 / 1 RSS 面板 / 2 设置 / 3 遮罩。
+/// 覆盖层当前模式：0 隐藏 / 1 RSS 面板 / 2 设置 / 3 遮罩 / 4 收录结果气泡 / 5 收录修改选择器。
 static UI_MODE: AtomicU64 = AtomicU64::new(0);
+static CAP_POP_SHOWN: AtomicBool = AtomicBool::new(false);
+
+static CAPTURE_POS: OnceLock<Mutex<Option<(f64, f64, f64)>>> = OnceLock::new();
+
+fn capture_pos_cell() -> &'static Mutex<Option<(f64, f64, f64)>> {
+    return CAPTURE_POS.get_or_init(|| Mutex::new(None));
+}
+
+fn set_capture_pos(pos: Option<(f64, f64, f64)>) {
+    let mut g = capture_pos_cell().lock().unwrap_or_else(|e| e.into_inner());
+    *g = pos;
+}
+
+fn take_capture_pos() -> Option<(f64, f64, f64)> {
+    let mut g = capture_pos_cell().lock().unwrap_or_else(|e| e.into_inner());
+    return g.take();
+}
 
 fn overlay_show(app: &AppHandle) -> Result<tauri::Webview, String> {
     let wv = app.get_webview("overlay").ok_or_else(|| "no overlay webview".to_string())?;
@@ -85,6 +103,7 @@ pub fn ui_hide(app: &AppHandle) -> Result<String, String> {
 }
 
 pub fn ui_command(app: &AppHandle, op: &str) -> Result<String, String> {
+    capture_pop_force_hide(app);
     if op == "close" || op == "hide" {
         return ui_hide(app);
     }
@@ -106,11 +125,21 @@ pub fn ui_command(app: &AppHandle, op: &str) -> Result<String, String> {
         let _ = eval_string(app, "overlay", "window.__C96_UI__&&window.__C96_UI__.settings();");
         return Ok("settings".to_string());
     }
+    if op == "capture_chooser" {
+        if UI_MODE.load(Ordering::Relaxed) == 5 {
+            return ui_hide(app);
+        }
+        overlay_show(app)?;
+        UI_MODE.store(5, Ordering::Relaxed);
+        let _ = eval_string(app, "overlay", "window.__C96_UI__&&window.__C96_UI__.captureChooser();");
+        return Ok("capture chooser".to_string());
+    }
     return Ok("unknown ui op".to_string());
 }
 
 /// 浏览器爬取期间的稳定遮罩（独立覆盖层 WebView，不随目标页刷新）。
 pub fn ui_mask(app: &AppHandle, text: &str) {
+    capture_pop_force_hide(app);
     if overlay_show(app).is_err() {
         return;
     }
@@ -123,6 +152,40 @@ pub fn ui_mask_hide(app: &AppHandle) {
     if UI_MODE.load(Ordering::Relaxed) == 3 {
         let _ = ui_hide(app);
     }
+}
+
+fn trigger_capture(app: &AppHandle, query: &str) {
+    let js = if query.is_empty() {
+        "window.__C96_CAPTURE__&&window.__C96_CAPTURE__();".to_string()
+    } else {
+        format!("window.__C96_CAPTURE__&&window.__C96_CAPTURE__({});", serde_json::to_string(query).unwrap_or_else(|_| "\"\"".to_string()))
+    };
+    let a = app.clone();
+    std::thread::spawn(move || {
+        let _ = eval_string(&a, "main", &js);
+    });
+}
+
+fn capture_pop_force_hide(app: &AppHandle) {
+    let was_shown = CAP_POP_SHOWN.swap(false, Ordering::Relaxed);
+    if was_shown {
+        if let Some(pop) = app.get_webview("capture_pop") {
+            let _ = pop.set_size(LogicalSize::new(1.0, 1.0));
+            let _ = pop.hide();
+        }
+    }
+    if UI_MODE.load(Ordering::Relaxed) == 4 {
+        UI_MODE.store(0, Ordering::Relaxed);
+    }
+}
+
+fn capture_result_popover(app: &AppHandle, _pos: (f64, f64, f64), msg: &str, modify: bool) {
+    capture_pop_force_hide(app);
+    let _ = eval_string(app, "toolbar", &format!(
+        "window.__C96_SHOW_CAPTURE_RESULT__&&window.__C96_SHOW_CAPTURE_RESULT__({}, {});",
+        serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".to_string()),
+        if modify { "true" } else { "false" }
+    ));
 }
 
 fn now_ms() -> u128 {
@@ -193,12 +256,30 @@ pub fn ingest(app: &AppHandle, label: &str, raw: &str) {
     }
     if kind == "cmd" {
         let cmd = detail.to_string();
-        let a = app.clone();
-        std::thread::spawn(move || {
-            if cmd == "capture" {
-                let _ = eval_string(&a, "main", "window.__C96_CAPTURE__&&window.__C96_CAPTURE__();");
+        if cmd == "capture" {
+            if let (Some(x), Some(y)) = (v.get("x").and_then(|x| x.as_f64()), v.get("y").and_then(|x| x.as_f64())) {
+                let w = v.get("w").and_then(|x| x.as_f64()).unwrap_or(80.0);
+                set_capture_pos(Some((x, y, w)));
+            } else {
+                set_capture_pos(None);
             }
-        });
+            trigger_capture(app, "");
+        }
+        return;
+    }
+    if kind == "popover" {
+        let op = detail.to_string();
+        if op == "capture_hide" {
+            capture_pop_force_hide(app);
+        } else if op == "capture_confirm" {
+            let q = v.get("query").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if UI_MODE.load(Ordering::Relaxed) == 5 {
+                let _ = ui_hide(app);
+            }
+            capture_pop_force_hide(app);
+            trigger_capture(app, &q);
+        }
+        record(app, "popover", &op, "");
         return;
     }
     if kind == "ui" {
@@ -217,11 +298,17 @@ pub fn ingest(app: &AppHandle, label: &str, raw: &str) {
         let lr = v.get("link_ratio").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let chars = text.chars().count();
         // E7 闸门：整块都是链接的页面（导航页 / 搜索结果页 / 列表页）不进知识库
+        let pos_for_pop = take_capture_pos();
         if lr >= 0.7 && chars < 3000 {
             record(app, "store-skip", url, &format!("skip: link-ratio {:.0}% ({} 字, {} {})", lr * 100.0, chars, mode, sel));
+            if let Some(pos) = pos_for_pop {
+                let a = app.clone();
+                std::thread::spawn(move || capture_result_popover(&a, pos, "跳过：链接页", false));
+            }
             return;
         }
-        let q = current_query();
+        let query_override = v.get("query").and_then(|x| x.as_str()).unwrap_or("");
+        let q = if query_override.is_empty() { current_query() } else { query_override.to_string() };
         let saved = match crate::store::save_capture(app, url, title, text, &q, 200, mode) {
             Ok(msg) => {
                 record(app, "store", url, &format!("{} · {} 链接{:.0}%{}", msg, mode, lr * 100.0, if sel.is_empty() { String::new() } else { format!(" · {}", sel) }));
@@ -233,9 +320,23 @@ pub fn ingest(app: &AppHandle, label: &str, raw: &str) {
             }
         };
         let a = app.clone();
+        let override_for_status = query_override.to_string();
         std::thread::spawn(move || {
-            let msg = if saved { "已收录当前页面" } else { "收录失败" };
-            let _ = eval_string(&a, "toolbar", &format!("window.__C96_STATUS__&&window.__C96_STATUS__({});", serde_json::to_string(msg).unwrap_or_default()));
+            let status_msg = if saved {
+                if override_for_status.is_empty() { "已收录当前页面".to_string() } else { format!("已收录到「{}」", override_for_status) }
+            } else {
+                "收录失败".to_string()
+            };
+            let _ = eval_string(&a, "toolbar", &format!("window.__C96_STATUS__&&window.__C96_STATUS__({});", serde_json::to_string(&status_msg).unwrap_or_default()));
+            if let Some(pos) = pos_for_pop {
+                if !saved {
+                    capture_result_popover(&a, pos, "收录失败", false);
+                } else if override_for_status.is_empty() {
+                    capture_result_popover(&a, pos, "成功", true);
+                } else {
+                    capture_result_popover(&a, pos, &format!("已收录到「{}」", override_for_status), false);
+                }
+            }
         });
         return;
     }
@@ -595,11 +696,16 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       vector_title: "向量模型", vector_hint: "支持 OpenAI/Ollama 兼容 embeddings 接口；保存后新收录内容会写入向量，后台也会逐步补历史向量。",
       auto_capture_title: "浏览网页时自动收录（可能会导致目录混乱）",
       auto_capture_hint: "关闭后，浏览页面不会自动写入 RAG；仍可手动点“收录”。",
+      capture_target_title: "收录到订阅",
+      capture_ph: "输入匹配订阅", capture_add: "增加", capture_ok: "确定",
+      capture_none: "没有匹配订阅", capture_pick: "请选择关键词", capture_adding: "增加订阅中…", capture_added: "已增加订阅并选中",
+      capture_modify: "修改",
       vec_enabled: "启用向量模型", vec_base: "Base URL", vec_model: "模型名称", vec_key: "API Key（可选）", vec_dim: "向量维度（0=自动）",
       vec_save: "保存向量配置", vec_test: "测试", vec_saved: "已保存向量配置", vec_test_ok: "向量接口可用", vec_missing: "请先填写 Base URL 和模型名称",
       rss_title: "RSS 内容管理器（增删改查）", rss_panel_title: "RSS 内容管理器",
       refresh: "刷新", loading: "加载中…", add_sub: "添加订阅",
-      kw_ph: "关键词：新订阅会立刻搜索并入 RAG", interval_title: "刷新间隔（秒）",
+      kw_ph: "关键词：新订阅会立刻搜索并入 RAG", interval_title: "刷新间隔（分钟）",
+      interval_label: "间隔", min_unit: "分钟", interval_updated: "间隔已改为", interval_bad: "间隔要大于 0 分钟", interval_default: "180",
       topics: "关键词订阅 ", sources: "来源分组 ", all_content: "全部内容 ",
       filter_ph: "过滤 标题/网址/主机/来源", only_manual: "只看随手收录", show_all: "显示全部",
       hosts: "主机制 ", blocklist: "URL 黑名单 ",
@@ -618,11 +724,16 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       vector_title: "Vector model", vector_hint: "OpenAI/Ollama-compatible embeddings endpoints are supported. After saving, new captures write vectors; old docs are backfilled gradually.",
       auto_capture_title: "Auto-capture while browsing (can clutter the library)",
       auto_capture_hint: "When off, browsing pages are not saved to RAG automatically; manual Capture still works.",
+      capture_target_title: "Capture to subscription",
+      capture_ph: "Type to filter subscriptions", capture_add: "Add", capture_ok: "OK",
+      capture_none: "No matching subscriptions", capture_pick: "Choose a keyword first", capture_adding: "Adding subscription…", capture_added: "Subscription added and selected",
+      capture_modify: "Edit",
       vec_enabled: "Enable vector model", vec_base: "Base URL", vec_model: "Model name", vec_key: "API key (optional)", vec_dim: "Dimensions (0 = auto)",
       vec_save: "Save vector config", vec_test: "Test", vec_saved: "Vector config saved", vec_test_ok: "Embedding endpoint OK", vec_missing: "Base URL and model are required",
       rss_title: "RSS content manager (CRUD)", rss_panel_title: "RSS Content Manager",
       refresh: "Refresh", loading: "Loading…", add_sub: "Add",
-      kw_ph: "Keyword: new subscription searches and saves to RAG immediately", interval_title: "Refresh interval (seconds)",
+      kw_ph: "Keyword: new subscription searches and saves to RAG immediately", interval_title: "Refresh interval (minutes)",
+      interval_label: "Interval", min_unit: "min", interval_updated: "Interval changed to", interval_bad: "Interval must be > 0 minutes", interval_default: "180",
       topics: "Keyword subscriptions ", sources: "Source groups ", all_content: "All content ",
       filter_ph: "Filter title/URL/host/source", only_manual: "Manual only", show_all: "Show all",
       hosts: "Hosts ", blocklist: "URL blocklist ",
@@ -960,18 +1071,61 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     var snapBtn = mkBarBtn("c96-snap-btn", L("snap_title"), "#93c5fd",
       '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#93c5fd" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>',
       L("snap"));
+    window.__C96_CAP_CANCEL__ = function () {};
     snapBtn.addEventListener("click", function (e) {
       e.preventDefault();
       e.stopPropagation();
       if (MODE === "toolbar") {
+        var r = snapBtn.getBoundingClientRect();
+        hideCapResult();
+        post("popover", "capture_hide");
         var st = document.getElementById("c96-status");
         if (st) { st.textContent = "收录中…"; }
-        post("cmd", "capture");
+        post("cmd", "capture", { x: r.left, y: r.bottom, w: r.width });
       } else {
         capture();
       }
     });
     bar.appendChild(snapBtn);
+    var capResultTimer = 0;
+    function hideCapResult() {
+      if (capResultTimer) { clearTimeout(capResultTimer); capResultTimer = 0; }
+      var btn = document.getElementById("c96-capture-modify-btn");
+      if (btn) { btn.style.display = "none"; }
+      var st = document.getElementById("c96-status");
+      if (st && (st.textContent === "成功" || st.textContent.indexOf("收录失败") >= 0 || st.textContent.indexOf("跳过：") === 0)) {
+        st.textContent = L("ready");
+        st.style.color = "#9aa4b2";
+      }
+    }
+    window.__C96_SHOW_CAPTURE_RESULT__ = function (msg, modify) {
+      var btn = document.getElementById("c96-capture-modify-btn");
+      var st = document.getElementById("c96-status");
+      if (capResultTimer) { clearTimeout(capResultTimer); capResultTimer = 0; }
+      if (st) {
+        st.textContent = msg || "";
+        st.style.color = ((msg || "").indexOf("失败") >= 0 || (msg || "").indexOf("跳过") >= 0) ? "#f87171" : "#86efac";
+      }
+      if (btn) {
+        btn.textContent = L("capture_modify");
+        btn.title = L("capture_modify");
+        btn.style.display = modify ? "flex" : "none";
+      }
+      if (msg || modify) {
+        capResultTimer = setTimeout(hideCapResult, 12000);
+      }
+    };
+    var capModBtn = mkBarBtn("c96-capture-modify-btn", L("capture_modify"), "#86efac",
+      '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#86efac" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>',
+      L("capture_modify"));
+    capModBtn.style.display = "none";
+    capModBtn.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      hideCapResult();
+      if (MODE === "toolbar") { post("ui", "capture_chooser"); }
+    });
+    bar.appendChild(capModBtn);
     // RSS 内容管理器：顶部工具栏图标 -> 弹层（增删改查）
     var rssBtn = mkBarBtn("c96-rss-btn", L("rss_title"), "#f59e0b",
       '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2.4" stroke-linecap="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1.5" fill="#f59e0b" stroke="none"/></svg>',
@@ -979,6 +1133,8 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     rssBtn.addEventListener("click", function (e) {
       e.preventDefault();
       e.stopPropagation();
+      hideCapResult();
+      if (MODE === "toolbar") { post("popover", "capture_hide"); }
       toggleRssPanel();
     });
     bar.appendChild(rssBtn);
@@ -989,6 +1145,8 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     setBtn.addEventListener("click", function (e) {
       e.preventDefault();
       e.stopPropagation();
+      hideCapResult();
+      if (MODE === "toolbar") { post("popover", "capture_hide"); }
       openSettings();
     });
     bar.appendChild(setBtn);
@@ -1010,7 +1168,7 @@ pub const OVERLAY_INIT: &str = r##"(function () {
   var CAP = { url: "", seq: 0, last: -1, tries: 0, stable: 0, fired: false };
   var AUTO_CAPTURE = false;
   var FORCE_CAPTURE = false;
-  function capture() {
+  function capture(queryOverride) {
     var bar = document.getElementById("c96-bar");
     var status = document.getElementById("c96-status");
     if (bar) { bar.style.display = "none"; }
@@ -1018,11 +1176,13 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     var text = r.text || "";
     var title = document.title || "";
     if (bar) { bar.style.display = "flex"; }
+    var q = queryOverride || "";
     if (status) {
       var tag = r.mode + (r.selector ? " " + r.selector : "") + (r.linkRatio ? " · 链接 " + Math.round(r.linkRatio * 100) + "%" : "");
-      status.textContent = "已送存 " + String(text.length) + " 字（" + tag + "）";
+      var suffix = q ? " → " + q : "";
+      status.textContent = "已送存 " + String(text.length) + " 字（" + tag + "）" + suffix;
     }
-    post("capture", "", { title: title, text: text, mode: r.mode, selector: r.selector, link_ratio: r.linkRatio, chars: r.chars });
+    post("capture", "", { title: title, text: text, mode: r.mode, selector: r.selector, link_ratio: r.linkRatio, chars: r.chars, query: q });
   }
   // 抢在正文渲染出来之前抓会把菜单存进去：等到「文本长度稳定」再送存，最多等 8 次。
   function tick(seq) {
@@ -1164,20 +1324,21 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     q.setAttribute("style", "flex:1;height:28px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 8px;font:12px system-ui;");
     var iv = document.createElement("input");
     iv.id = "c96-rss-new-int";
-    iv.value = "300";
+    iv.value = L("interval_default");
     iv.title = L("interval_title");
     iv.setAttribute("style", "width:64px;height:28px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 6px;font:12px system-ui;");
     var add = rssBtnNew(L("add_sub"), "c96-rss-add", "#93c5fd");
     add.addEventListener("click", function () {
       var text = (q.value || "").trim();
       if (!text) { rssStatus("请输入关键词"); return; }
-      var secs = parseInt(iv.value, 10);
-      if (!(secs > 0)) { secs = 300; }
+      var mins = parseInt(iv.value, 10);
+      if (!(mins > 0)) { mins = 180; }
+      var secs = mins * 60;
       rssStatus("搜索入库中：" + text + " …");
       ipc("topic_query", { query: text, cache_only: false, cacheOnly: false }).then(function (r) {
         var hits = (r && r.hits) ? r.hits.length : 0;
         return ipc("topic_update", { query: text, interval_secs: secs, intervalSecs: secs, paused: false }).then(function () {
-          rssStatus("已新增订阅「" + text + "」命中 " + hits + " 条 · 间隔 " + secs + "s");
+          rssStatus("已新增订阅「" + text + "」命中 " + hits + " 条 · " + L("interval_label") + " " + mins + " " + L("min_unit"));
           q.value = "";
           return reloadRss();
         });
@@ -1370,7 +1531,8 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     name.textContent = "「" + t.query + "」";
     name.setAttribute("style", "font-weight:600;flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
     var meta = document.createElement("span");
-    meta.textContent = "间隔 " + t.interval_secs + "s · runs " + t.runs + " · 入库 " + t.stored + (t.paused ? " · 已暂停" : "");
+    var shownMins = Math.max(1, Math.round((t.interval_secs || 0) / 60));
+    meta.textContent = L("interval_label") + " " + shownMins + " " + L("min_unit") + " · runs " + t.runs + " · 入库 " + t.stored + (t.paused ? " · 已暂停" : "");
     meta.setAttribute("style", "color:#9aa4b2;font-size:12px;");
     head.appendChild(name);
     head.appendChild(meta);
@@ -1393,15 +1555,16 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     });
     var int = document.createElement("input");
     int.id = "c96-rss-int-" + t.key;
-    int.value = String(t.interval_secs);
-    int.title = "刷新间隔（秒）";
+    int.value = String(Math.max(1, Math.round((t.interval_secs || 0) / 60)));
+    int.title = L("interval_title");
     int.setAttribute("style", "width:64px;height:24px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:5px;padding:0 6px;font:12px system-ui;");
     var save = rssBtnNew(L("save_interval"), "c96-rss-save-" + t.key, "#86efac");
     save.addEventListener("click", function () {
-      var v = parseInt(int.value, 10);
-      if (!(v > 0)) { rssStatus("间隔要大于 0 秒"); return; }
-      ipc("topic_update", { query: t.query, interval_secs: v, intervalSecs: v, paused: null }).then(function () {
-        rssStatus("「" + t.query + "」间隔改为 " + v + "s");
+      var mins = parseInt(int.value, 10);
+      if (!(mins > 0)) { rssStatus(L("interval_bad")); return; }
+      var secs = mins * 60;
+      ipc("topic_update", { query: t.query, interval_secs: secs, intervalSecs: secs, paused: null }).then(function () {
+        rssStatus("「" + t.query + "」" + L("interval_updated") + " " + mins + " " + L("min_unit"));
         return reloadRss();
       }).catch(function (e) { rssStatus("改间隔失败：" + e); });
     });
@@ -1815,6 +1978,346 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     setShellBg(false);
     setShellClick(false);
   }
+  var CAP_POP_STATE = { query: "", topics: [] };
+  var CAP_LEAVE_TIMER = 0;
+  var CAP_POS = { x: 80, y: 46, w: 80 };
+  function capCancelLeave() {
+    if (CAP_LEAVE_TIMER) { clearTimeout(CAP_LEAVE_TIMER); CAP_LEAVE_TIMER = 0; }
+  }
+  function capLeaveSoon() {
+    capCancelLeave();
+    CAP_LEAVE_TIMER = setTimeout(function () {
+      CAP_LEAVE_TIMER = 0;
+      post("popover", "capture_hide");
+    }, 500);
+  }
+  function capResultHide() {
+    var r = document.getElementById("c96-capture-result");
+    if (r) { r.style.display = "none"; }
+  }
+  function capResultShow(modify, x, y, w, msg) {
+    var p = document.getElementById("c96-capture-popover");
+    if (p) { p.style.display = "none"; }
+    CAP_POS = { x: x || CAP_POS.x, y: y || CAP_POS.y, w: w || CAP_POS.w };
+    var r = document.getElementById("c96-capture-result");
+    if (!r) {
+      r = document.createElement("div");
+      r.id = "c96-capture-result";
+      r.setAttribute("style", "display:none;position:fixed;left:0;top:0;width:100%;height:100%;z-index:2147483647;background:#14161a;color:#e6e6e6;border:1px solid #2a2e36;border-radius:8px;box-sizing:border-box;padding:8px;font:13px/1.4 system-ui,'Segoe UI',sans-serif;display:flex;align-items:center;gap:8px;");
+      var msgEl = document.createElement("div");
+      msgEl.id = "c96-capture-result-text";
+      msgEl.setAttribute("style", "flex:1;min-width:0;color:#86efac;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:700;");
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.id = "c96-capture-modify-btn";
+      btn.textContent = L("capture_modify");
+      btn.setAttribute("style", "height:26px;padding:0 10px;background:#1c2027;color:#93c5fd;border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
+      btn.addEventListener("click", function () {
+        post("popover", "capture_chooser_show", { x: CAP_POS.x, y: CAP_POS.y, w: CAP_POS.w });
+        capResultHide();
+      });
+      r.appendChild(msgEl); r.appendChild(btn);
+      r.addEventListener("mouseenter", capCancelLeave);
+      r.addEventListener("mouseleave", capLeaveSoon);
+      (document.body || document.documentElement).appendChild(r);
+    }
+    var msgEl2 = document.getElementById("c96-capture-result-text");
+    if (msgEl2) { msgEl2.textContent = msg || ""; msgEl2.style.color = (msg || "").indexOf("失败") >= 0 || (msg || "").indexOf("跳过") >= 0 ? "#f87171" : "#86efac"; }
+    var btn2 = document.getElementById("c96-capture-modify-btn");
+    if (btn2) { btn2.style.display = modify ? "inline-block" : "none"; btn2.textContent = L("capture_modify"); }
+    r.style.display = "flex";
+    r.style.pointerEvents = "auto";
+    capCancelLeave();
+    setShellBg(false);
+    setShellClick(true);
+  }
+  function capPopoverStatus(msg, color) {
+    var el = document.getElementById("c96-cap-pop-status");
+    if (el) { el.textContent = msg || ""; el.style.color = color || "#6b7280"; }
+  }
+  function capPopoverTopics() { return CAP_POP_STATE.topics || []; }
+  function capPopoverTopicText(t) {
+    return t && (t.query || t.key) ? String(t.query || t.key) : "";
+  }
+  function capPopoverRender() {
+    var list = document.getElementById("c96-cap-pop-list");
+    var input = document.getElementById("c96-cap-pop-input");
+    if (!list) { return; }
+    var text = (input && input.value || "").trim();
+    var needle = text.toLowerCase();
+    var rows = capPopoverTopics();
+    var out = [];
+    for (var i = 0; i < rows.length; i++) {
+      var q = capPopoverTopicText(rows[i]);
+      if (!q) { continue; }
+      if (!needle || q.toLowerCase().indexOf(needle) >= 0) { out.push(q); }
+    }
+    if (needle && out.indexOf(needle) < 0 && text) { out.unshift(text + "  ↵ " + L("capture_add")); }
+    list.textContent = "";
+    if (!out.length) {
+      var empty = document.createElement("div");
+      empty.textContent = L("capture_none");
+      empty.setAttribute("style", "color:#6b7280;font-size:12px;padding:8px;");
+      list.appendChild(empty);
+      return;
+    }
+    for (var j = 0; j < out.length && j < 50; j++) {
+      var raw = out[j];
+      var isAdd = raw.indexOf("  ↵ " + L("capture_add")) >= 0;
+      var q2 = isAdd ? raw.slice(0, raw.indexOf("  ↵ " + L("capture_add"))) : raw;
+      var row = document.createElement("div");
+      row.textContent = q2;
+      row.setAttribute("style", "padding:6px 8px;cursor:pointer;color:" + (CAP_POP_STATE.query === q2 ? "#86efac" : "#e6e6e6") + ";font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;");
+      row.addEventListener("mouseenter", function () { this.style.background = "#1c2027"; });
+      row.addEventListener("mouseleave", function () { this.style.background = "transparent"; });
+      (function (qq, add) {
+        row.addEventListener("click", function () {
+          if (add) { capPopoverAdd(qq); } else { capPopoverSelect(qq); }
+        });
+      })(q2, isAdd);
+      list.appendChild(row);
+    }
+  }
+  function capPopoverSelect(q) {
+    CAP_POP_STATE.query = q || "";
+    var input = document.getElementById("c96-cap-pop-input");
+    if (input) { input.value = CAP_POP_STATE.query; }
+    capPopoverRender();
+    capPopoverStatus("");
+  }
+  function capPopoverLoad() {
+    try {
+      ipc("topic_list", {}).then(function (rows) {
+        CAP_POP_STATE.topics = rows || [];
+        capPopoverRender();
+      }).catch(function (e) { capPopoverStatus(String(e), "#f87171"); });
+    } catch (e) { capPopoverStatus(String(e), "#f87171"); }
+  }
+  function capPopoverAdd(q) {
+    var text = (q || "").trim();
+    if (!text) { capPopoverStatus(L("capture_pick"), "#f87171"); return; }
+    capPopoverStatus(L("capture_adding"), "#9aa4b2");
+    try {
+      ipc("topic_add", { query: text }).then(function () {
+        capPopoverStatus(L("capture_added"), "#86efac");
+        capPopoverSelect(text);
+        capPopoverLoad();
+      }).catch(function (e) { capPopoverStatus("增加失败: " + e, "#f87171"); });
+    } catch (e) { capPopoverStatus("增加失败: " + e, "#f87171"); }
+  }
+  function capPopoverOk() {
+    var input = document.getElementById("c96-cap-pop-input");
+    var q = CAP_POP_STATE.query || (input && input.value || "").trim();
+    if (!q) { capPopoverStatus(L("capture_pick"), "#f87171"); return; }
+    post("popover", "capture_confirm", { query: q, x: CAP_POS.x, y: CAP_POS.y, w: CAP_POS.w });
+    capPopoverHideLocal();
+  }
+  function capPopoverHideLocal() {
+    var p = document.getElementById("c96-capture-popover");
+    if (p) { p.style.display = "none"; }
+    capResultHide();
+    capCancelLeave();
+    setShellClick(false);
+    setShellBg(false);
+  }
+  function capPopoverShow(x, y, w) {
+    var p = document.getElementById("c96-capture-popover");
+    if (!p) {
+      p = document.createElement("div");
+      p.id = "c96-capture-popover";
+      p.setAttribute("style", "display:none;position:fixed;width:280px;max-width:calc(100vw - 16px);z-index:2147483647;background:#14161a;color:#e6e6e6;border:1px solid #2a2e36;border-radius:10px;box-shadow:0 14px 44px rgba(0,0,0,.55);padding:10px;box-sizing:border-box;font:13px/1.5 system-ui,'Segoe UI',sans-serif;");
+      var title = document.createElement("div");
+      title.textContent = L("capture_target_title");
+      title.setAttribute("style", "color:#93c5fd;font-weight:700;margin-bottom:7px;");
+      var row = document.createElement("div");
+      row.setAttribute("style", "display:flex;gap:6px;");
+      var input = document.createElement("input");
+      input.id = "c96-cap-pop-input";
+      input.type = "text";
+      input.placeholder = L("capture_ph");
+      input.setAttribute("style", "flex:1;min-width:0;height:28px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 8px;font:12px system-ui;outline:none;");
+      input.addEventListener("input", function () { CAP_POP_STATE.query = ""; capPopoverRender(); });
+      input.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); capPopoverOk(); } });
+      var add = document.createElement("button");
+      add.type = "button";
+      add.textContent = L("capture_add");
+      add.setAttribute("style", "height:28px;padding:0 10px;background:#1c2027;color:#93c5fd;border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
+      add.addEventListener("click", function () {
+        var box = document.getElementById("c96-cap-pop-input");
+        capPopoverAdd(box ? box.value : "");
+      });
+      row.appendChild(input); row.appendChild(add);
+      var list = document.createElement("div");
+      list.id = "c96-cap-pop-list";
+      list.setAttribute("style", "max-height:180px;overflow:auto;margin:7px 0;border-top:1px solid #2a2e36;border-bottom:1px solid #2a2e36;padding:4px 0;");
+      var foot = document.createElement("div");
+      foot.setAttribute("style", "display:flex;align-items:center;gap:8px;");
+      var status = document.createElement("div");
+      status.id = "c96-cap-pop-status";
+      status.setAttribute("style", "flex:1;min-width:0;color:#6b7280;font-size:12px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
+      var ok = document.createElement("button");
+      ok.type = "button";
+      ok.textContent = "✓ " + L("capture_ok");
+      ok.setAttribute("style", "height:28px;padding:0 12px;background:#1c2027;color:#86efac;border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
+      ok.addEventListener("click", capPopoverOk);
+      foot.appendChild(status); foot.appendChild(ok);
+      p.appendChild(title); p.appendChild(row); p.appendChild(list); p.appendChild(foot);
+      p.addEventListener("mouseenter", capCancelLeave);
+      p.addEventListener("mouseleave", capLeaveSoon);
+      (document.body || document.documentElement).appendChild(p);
+    }
+    var width = Math.max(80, w || 80);
+    var left = (x || 0) + width / 2 - 140;
+    p.style.display = "block";
+    p.style.pointerEvents = "auto";
+    var maxLeft = Math.max(8, window.innerWidth - p.offsetWidth - 8);
+    p.style.left = Math.max(8, Math.min(left, maxLeft)) + "px";
+    p.style.top = ((y || 46) + 4) + "px";
+    CAP_POP_STATE.query = "";
+    var box = document.getElementById("c96-cap-pop-input");
+    if (box) { box.value = ""; }
+    capPopoverStatus("");
+    capPopoverLoad();
+  }
+  var CAP_CHO_STATE = { query: "", topics: [] };
+  function capChoStatus(msg, color) {
+    var el = document.getElementById("c96-cap-cho-status");
+    if (el) { el.textContent = msg || ""; el.style.color = color || "#6b7280"; }
+  }
+  function capChoTopicText(t) { return t && (t.query || t.key) ? String(t.query || t.key) : ""; }
+  function capChoRender() {
+    var list = document.getElementById("c96-cap-cho-list");
+    var input = document.getElementById("c96-cap-cho-input");
+    if (!list) { return; }
+    var text = (input && input.value || "").trim();
+    var needle = text.toLowerCase();
+    var out = [];
+    for (var i = 0; i < CAP_CHO_STATE.topics.length; i++) {
+      var q = capChoTopicText(CAP_CHO_STATE.topics[i]);
+      if (!q) { continue; }
+      if (!needle || q.toLowerCase().indexOf(needle) >= 0) { out.push(q); }
+    }
+    if (needle && text && out.indexOf(text) < 0) { out.unshift(text); }
+    list.textContent = "";
+    if (!out.length) {
+      var empty = document.createElement("div");
+      empty.textContent = L("capture_none");
+      empty.setAttribute("style", "color:#6b7280;font-size:12px;padding:8px;");
+      list.appendChild(empty);
+      return;
+    }
+    for (var j = 0; j < out.length && j < 50; j++) {
+      var q2 = out[j];
+      var row = document.createElement("div");
+      row.textContent = q2;
+      row.setAttribute("style", "padding:7px 8px;cursor:pointer;color:" + (CAP_CHO_STATE.query === q2 ? "#86efac" : "#e6e6e6") + ";font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;");
+      row.addEventListener("mouseenter", function () { this.style.background = "#1c2027"; });
+      row.addEventListener("mouseleave", function () { this.style.background = "transparent"; });
+      (function (qq) { row.addEventListener("click", function () { capChoSelect(qq); }); })(q2);
+      list.appendChild(row);
+    }
+  }
+  function capChoSelect(q) {
+    CAP_CHO_STATE.query = q || "";
+    var input = document.getElementById("c96-cap-cho-input");
+    if (input) { input.value = CAP_CHO_STATE.query; }
+    capChoRender();
+    capChoStatus("");
+  }
+  function capChoLoad() {
+    try {
+      ipc("topic_list", {}).then(function (rows) {
+        CAP_CHO_STATE.topics = rows || [];
+        capChoRender();
+      }).catch(function (e) { capChoStatus(String(e), "#f87171"); });
+    } catch (e) { capChoStatus(String(e), "#f87171"); }
+  }
+  function capChoAdd(q) {
+    var text = (q || "").trim();
+    if (!text) { capChoStatus(L("capture_pick"), "#f87171"); return; }
+    capChoStatus(L("capture_adding"), "#9aa4b2");
+    try {
+      ipc("topic_add", { query: text }).then(function () {
+        capChoStatus(L("capture_added"), "#86efac");
+        capChoSelect(text);
+        capChoLoad();
+      }).catch(function (e) { capChoStatus("增加失败: " + e, "#f87171"); });
+    } catch (e) { capChoStatus("增加失败: " + e, "#f87171"); }
+  }
+  function capChoClose() {
+    var d = document.getElementById("c96-capture-chooser");
+    if (d) { d.style.display = "none"; }
+  }
+  function capChoOk() {
+    var input = document.getElementById("c96-cap-cho-input");
+    var q = CAP_CHO_STATE.query || (input && input.value || "").trim();
+    if (!q) { capChoStatus(L("capture_pick"), "#f87171"); return; }
+    try { post("popover", "capture_confirm", { query: q }); } catch (e) {}
+    capChoClose();
+    if (MODE === "overlay") { try { post("ui", "close"); } catch (e) {} }
+  }
+  function openCaptureChooser() {
+    if (MODE === "toolbar") { post("ui", "capture_chooser"); return null; }
+    var d = document.getElementById("c96-capture-chooser");
+    if (!d) {
+      d = document.createElement("div");
+      d.id = "c96-capture-chooser";
+      d.setAttribute("style", "display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;background:transparent;align-items:center;justify-content:center;font:13px/1.5 system-ui,'Segoe UI',sans-serif;pointer-events:auto;");
+      var card = document.createElement("div");
+      card.setAttribute("style", "width:320px;max-width:92vw;max-height:80vh;overflow:hidden;background:#14161a;color:#e6e6e6;border:1px solid #2a2e36;border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,.6);padding:14px;box-sizing:border-box;pointer-events:auto;");
+      var h = document.createElement("div");
+      h.textContent = L("capture_target_title");
+      h.setAttribute("style", "color:#93c5fd;font-weight:700;margin-bottom:10px;");
+      var row = document.createElement("div");
+      row.setAttribute("style", "display:flex;gap:6px;");
+      var input = document.createElement("input");
+      input.id = "c96-cap-cho-input";
+      input.type = "text";
+      input.placeholder = L("capture_ph");
+      input.setAttribute("style", "flex:1;min-width:0;height:30px;background:#1c2027;color:#e6e6e6;border:1px solid #333a45;border-radius:6px;padding:0 8px;font:12px system-ui;outline:none;");
+      input.addEventListener("input", function () { CAP_CHO_STATE.query = ""; capChoRender(); });
+      input.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter") { ev.preventDefault(); capChoOk(); }
+        if (ev.key === "Escape") { ev.preventDefault(); capChoClose(); if (MODE === "overlay") { try { post("ui", "close"); } catch (e) {} } }
+      });
+      var add = document.createElement("button");
+      add.type = "button";
+      add.textContent = L("capture_add");
+      add.setAttribute("style", "height:30px;padding:0 10px;background:#1c2027;color:#93c5fd;border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
+      add.addEventListener("click", function () { capChoAdd(input.value); });
+      row.appendChild(input); row.appendChild(add);
+      var list = document.createElement("div");
+      list.id = "c96-cap-cho-list";
+      list.setAttribute("style", "max-height:260px;overflow:auto;margin:10px 0;border-top:1px solid #2a2e36;border-bottom:1px solid #2a2e36;padding:4px 0;");
+      var foot = document.createElement("div");
+      foot.setAttribute("style", "display:flex;align-items:center;gap:8px;");
+      var status = document.createElement("div");
+      status.id = "c96-cap-cho-status";
+      status.setAttribute("style", "flex:1;min-width:0;color:#6b7280;font-size:12px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
+      var close = document.createElement("button");
+      close.type = "button";
+      close.textContent = L("close");
+      close.setAttribute("style", "height:30px;padding:0 10px;background:#1c2027;color:#9aa4b2;border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
+      close.addEventListener("click", function () { capChoClose(); if (MODE === "overlay") { try { post("ui", "close"); } catch (e) {} } });
+      var ok = document.createElement("button");
+      ok.type = "button";
+      ok.textContent = "✓ " + L("capture_ok");
+      ok.setAttribute("style", "height:30px;padding:0 12px;background:#1c2027;color:#86efac;border:1px solid #333a45;border-radius:6px;cursor:pointer;font:12px system-ui;");
+      ok.addEventListener("click", capChoOk);
+      foot.appendChild(status); foot.appendChild(close); foot.appendChild(ok);
+      card.appendChild(h); card.appendChild(row); card.appendChild(list); card.appendChild(foot);
+      d.appendChild(card);
+      d.addEventListener("click", function (ev) { if (ev.target === d) { capChoClose(); if (MODE === "overlay") { try { post("ui", "close"); } catch (e) {} } } });
+      (document.body || document.documentElement).appendChild(d);
+    }
+    d.style.display = "flex";
+    CAP_CHO_STATE.query = "";
+    var inp = document.getElementById("c96-cap-cho-input");
+    if (inp) { inp.value = ""; setTimeout(function () { inp.focus(); }, 0); }
+    capChoStatus("");
+    capChoLoad();
+    return d;
+  }
   window.__C96_UI__ = {
     panel: function () {
       maskHide();
@@ -1833,6 +2336,49 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       if (d) { d.style.display = "flex"; d.style.pointerEvents = "auto"; }
       setShellClick(true);
     },
+    captureChooser: function () {
+      maskHide();
+      var p = document.getElementById("c96-rss-panel");
+      if (p) { p.style.display = "none"; }
+      var s = document.getElementById("c96-settings");
+      if (s) { s.style.display = "none"; }
+      openCaptureChooser();
+    },
+    captureResult: function (modify, x, y, w, msg) {
+      capResultShow(!!modify, x, y, w, msg);
+    },
+    capturePopoverEmbed: function (on) {
+      if (!on) {
+        capPopoverHideLocal();
+        capResultHide();
+        setShellClick(false);
+        setShellBg(false);
+        return;
+      }
+      capResultHide();
+      capCancelLeave();
+      capPopoverShow(140, -4, 0);
+      var p = document.getElementById("c96-capture-popover");
+      if (p) {
+        p.style.display = "block";
+        p.style.position = "fixed";
+        p.style.left = "0px";
+        p.style.top = "0px";
+        p.style.width = "100%";
+        p.style.height = "100%";
+        p.style.maxWidth = "100%";
+        p.style.borderRadius = "8px";
+        p.style.boxShadow = "none";
+        p.style.pointerEvents = "auto";
+      }
+      var list = document.getElementById("c96-cap-pop-list");
+      if (list) { list.style.maxHeight = "calc(100% - 116px)"; }
+      setShellBg(false);
+      setShellClick(true);
+    },
+    capturePopover: function (on, x, y, w) {
+      if (on) { capPopoverShow(x, y, w); } else { capPopoverHideLocal(); }
+    },
     mask: function (t) {
       var p = document.getElementById("c96-rss-panel");
       if (p) { p.style.display = "none"; }
@@ -1841,6 +2387,9 @@ pub const OVERLAY_INIT: &str = r##"(function () {
       maskShow(t);
     },
     hide: function () {
+      capChoClose();
+      capResultHide();
+      capPopoverHideLocal();
       maskHide();
       var p = document.getElementById("c96-rss-panel");
       if (p) { p.style.display = "none"; }
@@ -1866,6 +2415,11 @@ pub const OVERLAY_INIT: &str = r##"(function () {
     } else if (MODE === "overlay") {
       setShellBg(false);
       setShellClick(false);
+      syncLang();
+      setTimeout(syncLang, 1200);
+    } else if (MODE === "popover") {
+      setShellBg(false);
+      setShellClick(true);
       syncLang();
       setTimeout(syncLang, 1200);
     } else if (MODE === "content") {
